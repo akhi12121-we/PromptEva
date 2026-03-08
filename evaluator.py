@@ -33,6 +33,11 @@ ANTHROPIC_MODELS: list[str] = [
     "claude-3-7-sonnet-latest",
 ]
 
+GOOGLE_MODELS: list[str] = [
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash",
+]
+
 # ---------------------------------------------------------------------------
 # Metric definitions
 # ---------------------------------------------------------------------------
@@ -177,7 +182,7 @@ def _resolve_model(provider: str, model: str) -> str:
     """Return a valid model string, falling back to the first available model.
 
     Args:
-        provider: "OpenAI" or "Anthropic".
+        provider: "OpenAI", "Anthropic", or "Google".
         model:    User-selected model string (may be empty).
 
     Returns:
@@ -185,6 +190,8 @@ def _resolve_model(provider: str, model: str) -> str:
     """
     if provider == "OpenAI":
         return model if model in OPENAI_MODELS else OPENAI_MODELS[0]
+    if provider == "Google":
+        return model if model in GOOGLE_MODELS else GOOGLE_MODELS[0]
     return model if model in ANTHROPIC_MODELS else ANTHROPIC_MODELS[0]
 
 
@@ -192,12 +199,14 @@ def _check_api_key(provider: str) -> None:
     """Raise ValueError if the required API key is missing.
 
     Args:
-        provider: "OpenAI" or "Anthropic".
+        provider: "OpenAI", "Anthropic", or "Google".
     """
     if provider == "OpenAI" and not os.environ.get("OPENAI_API_KEY"):
         raise ValueError("OpenAI API key not set. Please save it in the Settings tab.")
     if provider == "Anthropic" and not os.environ.get("ANTHROPIC_API_KEY"):
         raise ValueError("Anthropic API key not set. Please save it in the Settings tab.")
+    if provider == "Google" and not os.environ.get("GOOGLE_API_KEY"):
+        raise ValueError("Google API key not set. Please save it in the Settings tab.")
 
 
 # ---------------------------------------------------------------------------
@@ -205,17 +214,40 @@ def _check_api_key(provider: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _build_metrics(model_str: str):
+def _make_eval_model(provider: str, model_str: str):
+    """Create the appropriate DeepEval model object for the given provider.
+
+    Args:
+        provider:   "OpenAI", "Anthropic", or "Google".
+        model_str:  Model identifier (e.g. "gpt-4o-mini", "claude-3-5-haiku-20241022").
+
+    Returns:
+        A model string (OpenAI) or DeepEval model object (Anthropic/Google).
+    """
+    if provider == "Anthropic":
+        from deepeval.models import AnthropicModel
+        return AnthropicModel(model=model_str)
+    if provider == "Google":
+        from deepeval.models import GeminiModel
+        return GeminiModel(model=model_str)
+    # OpenAI — DeepEval uses string directly
+    return model_str
+
+
+def _build_metrics(provider: str, model_str: str):
     """Create one GEval instance per metric definition.
 
     Args:
-        model_str: Model identifier passed to DeepEval (e.g. "gpt-4o-mini").
+        provider:  "OpenAI", "Anthropic", or "Google".
+        model_str: Model identifier.
 
     Returns:
         List of configured GEval metric objects.
     """
     from deepeval.metrics import GEval
     from deepeval.test_case import LLMTestCaseParams
+
+    eval_model = _make_eval_model(provider, model_str)
 
     metrics = []
     for mdef in METRIC_DEFS:
@@ -228,7 +260,7 @@ def _build_metrics(model_str: str):
                     LLMTestCaseParams.INPUT,
                     LLMTestCaseParams.ACTUAL_OUTPUT,
                 ],
-                model=model_str,
+                model=eval_model,
                 threshold=0.5,
                 async_mode=False,
             )
@@ -243,7 +275,7 @@ def run_evaluation(
 
     Args:
         prompt_text: The raw prompt string to evaluate.
-        provider:    "OpenAI" or "Anthropic".
+        provider:    "OpenAI", "Anthropic", or "Google".
         model:       Specific model to use (falls back to default if empty).
 
     Returns:
@@ -258,7 +290,7 @@ def run_evaluation(
     model_str = _resolve_model(provider, model)
 
     test_case = LLMTestCase(input=prompt_text, actual_output=prompt_text)
-    metrics = _build_metrics(model_str)
+    metrics = _build_metrics(provider, model_str)
 
     results: dict[str, dict[str, Any]] = {}
     for metric in metrics:
@@ -289,7 +321,7 @@ def refine_prompt(prompt_text: str, provider: str, model: str = "") -> str:
 
     Args:
         prompt_text: The original prompt to improve.
-        provider:    "OpenAI" or "Anthropic".
+        provider:    "OpenAI", "Anthropic", or "Google".
         model:       Specific model to use (falls back to default if empty).
 
     Returns:
@@ -303,6 +335,8 @@ def refine_prompt(prompt_text: str, provider: str, model: str = "") -> str:
 
     if provider == "OpenAI":
         return _refine_openai(prompt_text, model_str)
+    if provider == "Google":
+        return _refine_google(prompt_text, model_str)
     return _refine_anthropic(prompt_text, model_str)
 
 
@@ -352,3 +386,197 @@ def _refine_anthropic(prompt_text: str, model_str: str) -> str:
         max_tokens=2048,
     )
     return response.content[0].text
+
+
+def _refine_google(prompt_text: str, model_str: str) -> str:
+    """Call Google Gemini to refine a prompt.
+
+    Args:
+        prompt_text: The original prompt.
+        model_str:   Gemini model identifier.
+
+    Returns:
+        The model's response text.
+    """
+    from google import genai
+
+    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+    response = client.models.generate_content(
+        model=model_str,
+        contents=f"{REFINEMENT_SYSTEM_PROMPT}\n\n{prompt_text}",
+        config={
+            "temperature": 0.4,
+            "max_output_tokens": 2048,
+        },
+    )
+    return response.text or ""
+
+
+# ---------------------------------------------------------------------------
+# Token pricing
+# ---------------------------------------------------------------------------
+
+# Pricing per million tokens (USD).  Keys = model identifier.
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    # OpenAI
+    "gpt-4o-mini":              {"input": 0.15,  "output": 0.60},
+    "gpt-4o":                   {"input": 2.50,  "output": 10.00},
+    "gpt-4.1-mini":             {"input": 0.40,  "output": 1.60},
+    "gpt-4.1":                  {"input": 2.00,  "output": 8.00},
+    # Anthropic
+    "claude-3-5-haiku-20241022":   {"input": 0.80,  "output": 4.00},
+    "claude-3-5-sonnet-20241022":  {"input": 3.00,  "output": 15.00},
+    "claude-3-7-sonnet-latest":    {"input": 3.00,  "output": 15.00},
+    # Google
+    "gemini-2.0-flash-lite":    {"input": 0.075, "output": 0.30},
+    "gemini-2.0-flash":         {"input": 0.10,  "output": 0.40},
+}
+
+
+def _count_tokens_openai(text: str, model: str) -> int:
+    """Count tokens using tiktoken (offline, no API call).
+
+    Args:
+        text:  The prompt string to tokenize.
+        model: OpenAI model identifier.
+
+    Returns:
+        Approximate token count.
+    """
+    import tiktoken
+
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except KeyError:
+        enc = tiktoken.get_encoding("o200k_base")
+    return len(enc.encode(text))
+
+
+def _count_tokens_anthropic(text: str, model: str) -> int:
+    """Count tokens via the free Anthropic count_tokens endpoint.
+
+    Args:
+        text:  The prompt string.
+        model: Anthropic model identifier.
+
+    Returns:
+        Token count from the API.
+    """
+    from anthropic import Anthropic
+
+    client = Anthropic()
+    resp = client.messages.count_tokens(
+        model=model,
+        messages=[{"role": "user", "content": text}],
+    )
+    return resp.input_tokens
+
+
+def _count_tokens_google(text: str, model: str) -> int:
+    """Count tokens via Google genai count_tokens.
+
+    Args:
+        text:  The prompt string.
+        model: Gemini model identifier.
+
+    Returns:
+        Token count from the API.
+    """
+    from google import genai
+
+    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+    resp = client.models.count_tokens(model=model, contents=text)
+    return resp.total_tokens
+
+
+def calculate_token_pricing(
+    prompt_text: str,
+) -> list[dict[str, Any]]:
+    """Calculate token counts and costs for ALL models across all providers.
+
+    Token counting is always available for all models:
+      - OpenAI: uses tiktoken (offline, free).
+      - Anthropic / Google: uses their native count_tokens API when the key
+        is configured; falls back to tiktoken approximation otherwise.
+
+    Args:
+        prompt_text: The prompt to analyse.
+
+    Returns:
+        List of dicts, each with keys:
+            provider, model, tokens, input_cost, output_cost, source
+    """
+    results: list[dict[str, Any]] = []
+
+    has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    has_google = bool(os.environ.get("GOOGLE_API_KEY"))
+
+    # Shared tiktoken fallback for approximate counts.
+    def _tiktoken_approx(text: str) -> int:
+        import tiktoken
+        enc = tiktoken.get_encoding("o200k_base")
+        return len(enc.encode(text))
+
+    # --- OpenAI models (always exact via tiktoken) ---
+    for model in OPENAI_MODELS:
+        try:
+            tokens = _count_tokens_openai(prompt_text, model)
+            pricing = MODEL_PRICING[model]
+            results.append({
+                "provider": "OpenAI",
+                "model": model,
+                "tokens": tokens,
+                "input_cost": round(tokens * pricing["input"] / 1_000_000, 6),
+                "output_cost": round(tokens * pricing["output"] / 1_000_000, 6),
+            })
+        except Exception as exc:
+            results.append({
+                "provider": "OpenAI", "model": model, "tokens": 0,
+                "input_cost": 0.0, "output_cost": 0.0, "error": str(exc),
+            })
+
+    # --- Anthropic models ---
+    for model in ANTHROPIC_MODELS:
+        try:
+            if has_anthropic:
+                tokens = _count_tokens_anthropic(prompt_text, model)
+            else:
+                tokens = _tiktoken_approx(prompt_text)
+            pricing = MODEL_PRICING[model]
+            results.append({
+                "provider": "Anthropic",
+                "model": model,
+                "tokens": tokens,
+                "input_cost": round(tokens * pricing["input"] / 1_000_000, 6),
+                "output_cost": round(tokens * pricing["output"] / 1_000_000, 6),
+                **({"source": "approx"} if not has_anthropic else {}),
+            })
+        except Exception as exc:
+            results.append({
+                "provider": "Anthropic", "model": model, "tokens": 0,
+                "input_cost": 0.0, "output_cost": 0.0, "error": str(exc),
+            })
+
+    # --- Google models ---
+    for model in GOOGLE_MODELS:
+        try:
+            if has_google:
+                tokens = _count_tokens_google(prompt_text, model)
+            else:
+                tokens = _tiktoken_approx(prompt_text)
+            pricing = MODEL_PRICING[model]
+            results.append({
+                "provider": "Google",
+                "model": model,
+                "tokens": tokens,
+                "input_cost": round(tokens * pricing["input"] / 1_000_000, 6),
+                "output_cost": round(tokens * pricing["output"] / 1_000_000, 6),
+                **({"source": "approx"} if not has_google else {}),
+            })
+        except Exception as exc:
+            results.append({
+                "provider": "Google", "model": model, "tokens": 0,
+                "input_cost": 0.0, "output_cost": 0.0, "error": str(exc),
+            })
+
+    return results

@@ -482,3 +482,174 @@ def build_template_description_html(description: str, placeholders: list[str]) -
         f"{ph_html}"
         f"</div>"
     )
+
+
+# ---------------------------------------------------------------------------
+# Token pricing table
+# ---------------------------------------------------------------------------
+
+EMPTY_PRICING_HTML = (
+    '<div style="text-align:center; padding:48px 24px;'
+    " border:2px dashed #a5b4fc; border-radius:16px;"
+    ' background: linear-gradient(135deg, #eef2ff, #ede9fe);">'
+    '<div style="font-size:42px; margin-bottom:12px;">💰</div>'
+    '<div style="font-size:16px; font-weight:700; color:#4338ca;">'
+    "Enter a prompt and click Calculate Pricing</div>"
+    '<div style="font-size:13px; margin-top:8px; color:#6b7280;">'
+    "Token counts and costs will appear here for all configured providers</div>"
+    "</div>"
+)
+
+NO_KEYS_PRICING_HTML = (
+    '<div style="text-align:center; padding:36px 24px;'
+    " border:2px dashed #fca5a5; border-radius:16px;"
+    ' background: linear-gradient(135deg, #fef2f2, #fff1f2);">'
+    '<div style="font-size:36px; margin-bottom:10px;">🔑</div>'
+    '<div style="font-size:15px; font-weight:700; color:#dc2626;">'
+    "No API keys configured</div>"
+    '<div style="font-size:13px; margin-top:6px; color:#6b7280;">'
+    'Go to the <strong style="color:#7c3aed;">Settings</strong> tab to add '
+    "your OpenAI, Anthropic, or Google API keys first.</div>"
+    "</div>"
+)
+
+
+def build_pricing_table_html(results: list[dict]) -> str:
+    """Render token pricing results as a styled HTML table.
+
+    Args:
+        results: List of dicts from calculate_token_pricing(), each with
+                 provider, model, tokens, input_cost, output_cost, and
+                 optional error key.
+
+    Returns:
+        Styled HTML string with a comparison table.
+    """
+    if not results:
+        return NO_KEYS_PRICING_HTML
+
+    # Provider accent colors — high-contrast, industry-standard palette
+    provider_colors = {
+        "OpenAI": ("#059669", "#ecfdf5", "#065f46"),     # emerald
+        "Anthropic": ("#d97706", "#fffbeb", "#92400e"),  # amber
+        "Google": ("#2563eb", "#eff6ff", "#1e40af"),     # blue
+    }
+
+    html = '<div style="font-family:\'Inter\',\'Segoe UI\',system-ui,sans-serif;">'
+
+    # Summary header
+    total_models = len(results)
+    providers = sorted(set(r["provider"] for r in results))
+    provider_tags = " ".join(
+        f'<span style="display:inline-block;background:{provider_colors.get(p, ("#7c3aed","#ede9fe","#5b21b6"))[1]};'
+        f'color:{provider_colors.get(p, ("#7c3aed","#ede9fe","#5b21b6"))[2]};font-size:12px;font-weight:800;'
+        f'padding:4px 14px;border-radius:20px;margin:0 3px;'
+        f'border:1px solid {provider_colors.get(p, ("#7c3aed","#ede9fe","#5b21b6"))[0]}40;">{p}</span>'
+        for p in providers
+    )
+    html += (
+        '<div style="display:flex;align-items:center;gap:18px;margin-bottom:20px;'
+        "padding:20px 24px;border-radius:16px;"
+        'background:linear-gradient(135deg,#1e1b4b,#312e81);'
+        'border:1px solid #4338ca;box-shadow:0 8px 32px rgba(30,27,75,0.25);">'
+        '<div style="font-size:36px;">💰</div>'
+        "<div>"
+        '<div style="font-size:20px;font-weight:800;color:#ffffff;letter-spacing:-0.02em;">'
+        f"Token Pricing Comparison</div>"
+        '<div style="color:#c4b5fd;font-size:13px;margin-top:6px;">'
+        f"{total_models} models across {provider_tags}</div>"
+        "</div></div>"
+    )
+
+    # Table
+    html += (
+        '<div style="overflow-x:auto;border-radius:14px;border:1px solid #e2e8f0;'
+        'box-shadow:0 4px 16px rgba(0,0,0,0.06);">'
+        '<table style="width:100%;border-collapse:collapse;font-size:14px;'
+        'font-family:\'Inter\',\'Segoe UI\',system-ui,sans-serif;">'
+        "<thead>"
+        '<tr style="background:linear-gradient(135deg,#7c3aed,#6d28d9);">'
+        '<th style="padding:16px 18px;text-align:left;font-weight:700;font-size:13px;'
+        'color:#fff;letter-spacing:0.03em;text-transform:uppercase;">Provider</th>'
+        '<th style="padding:16px 18px;text-align:left;font-weight:700;font-size:13px;'
+        'color:#fff;letter-spacing:0.03em;text-transform:uppercase;">Model</th>'
+        '<th style="padding:16px 18px;text-align:right;font-weight:700;font-size:13px;'
+        'color:#fff;letter-spacing:0.03em;text-transform:uppercase;">Input Tokens</th>'
+        '<th style="padding:16px 18px;text-align:right;font-weight:700;font-size:13px;'
+        'color:#fff;letter-spacing:0.03em;text-transform:uppercase;">Rate ($/M)</th>'
+        '<th style="padding:16px 18px;text-align:right;font-weight:700;font-size:13px;'
+        'color:#fff;letter-spacing:0.03em;text-transform:uppercase;">Input Cost</th>'
+        '<th style="padding:16px 18px;text-align:right;font-weight:700;font-size:13px;'
+        'color:#fff;letter-spacing:0.03em;text-transform:uppercase;">Output Cost (est.)</th>'
+        "</tr></thead><tbody>"
+    )
+
+    from evaluator import MODEL_PRICING
+
+    for i, r in enumerate(results):
+        p_color, p_bg, p_dark = provider_colors.get(
+            r["provider"], ("#7c3aed", "#f8fafc", "#5b21b6")
+        )
+        row_bg = "#ffffff" if i % 2 == 0 else "#fafafe"
+        error = r.get("error", "")
+        is_approx = r.get("source") == "approx"
+        approx_badge = (' <span style="font-size:10px;color:#a78bfa;font-weight:600;'
+                        'background:#ede9fe;padding:1px 6px;border-radius:6px;margin-left:4px;"'
+                        ' title="Estimated via tiktoken (add API key for exact count)">≈ est.</span>'
+                        if is_approx else "")
+
+        pricing = MODEL_PRICING.get(r["model"], {})
+        rate_str = f'${pricing.get("input", 0):.3f}'
+
+        if error:
+            html += (
+                f'<tr style="background:{row_bg};">'
+                f'<td style="padding:14px 18px;border-bottom:1px solid #f1f5f9;">'
+                f'<span style="color:{p_dark};font-weight:800;font-size:13px;">{r["provider"]}</span></td>'
+                f'<td style="padding:14px 18px;border-bottom:1px solid #f1f5f9;'
+                f'color:#0f172a;font-weight:700;font-size:14px;">{r["model"]}</td>'
+                f'<td colspan="4" style="padding:14px 18px;border-bottom:1px solid #f1f5f9;'
+                f'color:#dc2626;font-size:13px;font-weight:600;">⚠ {error}</td>'
+                "</tr>"
+            )
+        else:
+            html += (
+                f'<tr style="background:{row_bg};transition:all 0.15s ease;"'
+                f' onmouseover="this.style.background=\'{p_bg}\';this.style.transform=\'scale(1.002)\'"'
+                f' onmouseout="this.style.background=\'{row_bg}\';this.style.transform=\'scale(1)\'">'
+                f'<td style="padding:14px 18px;border-bottom:1px solid #f1f5f9;">'
+                f'<span style="color:{p_dark};font-weight:800;font-size:13px;">{r["provider"]}</span></td>'
+                f'<td style="padding:14px 18px;border-bottom:1px solid #f1f5f9;'
+                f'color:#0f172a;font-weight:700;font-size:14px;">'
+                f'{r["model"]}</td>'
+                f'<td style="padding:14px 18px;border-bottom:1px solid #f1f5f9;text-align:right;'
+                f'font-weight:800;font-size:15px;color:#1e1b4b;">{r["tokens"]:,}{approx_badge}</td>'
+                f'<td style="padding:14px 18px;border-bottom:1px solid #f1f5f9;text-align:right;'
+                f'font-weight:600;font-size:13px;color:#64748b;">{rate_str}</td>'
+                f'<td style="padding:14px 18px;border-bottom:1px solid #f1f5f9;text-align:right;'
+                f'color:#059669;font-weight:800;font-size:14px;">${r["input_cost"]:.6f}</td>'
+                f'<td style="padding:14px 18px;border-bottom:1px solid #f1f5f9;text-align:right;'
+                f'color:#d97706;font-weight:800;font-size:14px;">${r["output_cost"]:.6f}</td>'
+                "</tr>"
+            )
+
+    html += "</tbody></table></div>"
+
+    # Footnote with explanation
+    html += (
+        '<div style="margin-top:14px;padding:12px 18px;border-radius:10px;'
+        'background:#f8fafc;border:1px solid #e2e8f0;">'
+        '<div style="font-size:12px;color:#475569;line-height:1.7;">'
+        '<strong style="color:#1e1b4b;">How costs are calculated:</strong> '
+        '<strong>Input Tokens</strong> = number of tokens in your prompt. '
+        '<strong>Input Cost</strong> = tokens × rate per million. '
+        '<strong>Output Cost</strong> = estimated assuming output is same length as input '
+        '(actual output length varies by response). '
+        '<strong>Rate ($/M)</strong> = price per million input tokens. '
+        '<br><span style="color:#7c3aed;font-weight:600;">≈ est.</span> = approximate '
+        "token count via tiktoken — add API key in Settings for exact count."
+        "</div></div>"
+    )
+
+    html += "</div>"
+    return html

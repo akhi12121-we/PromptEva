@@ -31,7 +31,9 @@ from dotenv import load_dotenv
 
 from evaluator import (
     ANTHROPIC_MODELS,
+    GOOGLE_MODELS,
     OPENAI_MODELS,
+    calculate_token_pricing,
     refine_prompt,
     run_evaluation,
 )
@@ -45,10 +47,12 @@ from prompt_library import (
 )
 from styles import (
     APP_CSS,
+    EMPTY_PRICING_HTML,
     EMPTY_REFINEMENT_HTML,
     EMPTY_RESULTS_HTML,
     HEADER_HTML,
     build_metric_cards_html,
+    build_pricing_table_html,
     build_refinement_html,
     build_results_html,
     build_template_description_html,
@@ -85,20 +89,21 @@ def _save_prompts(prompts: list[dict[str, Any]]) -> None:
     PROMPTS_FILE.write_text(json.dumps(prompts, indent=2, default=str))
 
 
-def _load_saved_keys() -> tuple[str, str]:
+def _load_saved_keys() -> tuple[str, str, str]:
     """Load API keys from .env into the environment.
 
     Returns:
-        Tuple of (openai_key, anthropic_key) — empty strings if unset.
+        Tuple of (openai_key, anthropic_key, google_key) — empty strings if unset.
     """
     load_dotenv(ENV_FILE, override=True)
     return (
         os.getenv("OPENAI_API_KEY", ""),
         os.getenv("ANTHROPIC_API_KEY", ""),
+        os.getenv("GOOGLE_API_KEY", ""),
     )
 
 
-def _persist_keys(openai_key: str, anthropic_key: str) -> str:
+def _persist_keys(openai_key: str, anthropic_key: str, google_key: str) -> str:
     """Validate API keys, write them to .env, and load into os.environ.
 
     Returns:
@@ -106,8 +111,9 @@ def _persist_keys(openai_key: str, anthropic_key: str) -> str:
     """
     openai_key = openai_key.strip()
     anthropic_key = anthropic_key.strip()
+    google_key = google_key.strip()
 
-    if not openai_key and not anthropic_key:
+    if not openai_key and not anthropic_key and not google_key:
         return "⚠ Please provide at least one API key."
 
     errors: list[str] = []
@@ -115,6 +121,8 @@ def _persist_keys(openai_key: str, anthropic_key: str) -> str:
         errors.append("OpenAI key should start with 'sk-'.")
     if anthropic_key and not anthropic_key.startswith("sk-ant-"):
         errors.append("Anthropic key should start with 'sk-ant-'.")
+    if google_key and not google_key.startswith("AIza"):
+        errors.append("Google key should start with 'AIza'.")
     if errors:
         return "⚠ Validation failed: " + " ".join(errors)
 
@@ -125,6 +133,9 @@ def _persist_keys(openai_key: str, anthropic_key: str) -> str:
     if anthropic_key:
         lines.append(f'ANTHROPIC_API_KEY="{anthropic_key}"')
         os.environ["ANTHROPIC_API_KEY"] = anthropic_key
+    if google_key:
+        lines.append(f'GOOGLE_API_KEY="{google_key}"')
+        os.environ["GOOGLE_API_KEY"] = google_key
 
     ENV_FILE.write_text("\n".join(lines) + "\n")
     return "✓ API keys saved to .env and loaded into environment."
@@ -452,7 +463,25 @@ def _update_model_choices(provider: str):
     """Return the model list matching the selected provider."""
     if provider == "OpenAI":
         return gr.update(choices=OPENAI_MODELS, value=OPENAI_MODELS[0])
+    if provider == "Google":
+        return gr.update(choices=GOOGLE_MODELS, value=GOOGLE_MODELS[0])
     return gr.update(choices=ANTHROPIC_MODELS, value=ANTHROPIC_MODELS[0])
+
+
+def _handle_calculate_pricing(prompt_text: str) -> str:
+    """Calculate token counts and pricing for all configured providers.
+
+    Returns:
+        Styled HTML table with token counts and costs.
+    """
+    if not prompt_text or not prompt_text.strip():
+        return "<p style='color:#dc2626;font-weight:600;'>Please enter a prompt first.</p>"
+    try:
+        results = calculate_token_pricing(prompt_text.strip())
+        return build_pricing_table_html(results)
+    except Exception as exc:
+        tb = traceback.format_exc()
+        return f"<pre style='color:#dc2626;'>Pricing calculation failed:\n{exc}\n\n{tb}</pre>"
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +492,7 @@ def _update_model_choices(provider: str):
 def build_app() -> gr.Blocks:
     """Construct the Gradio Blocks application with two-mode Evaluate tab."""
     saved_prompts = _load_prompts()
-    openai_key_init, anthropic_key_init = _load_saved_keys()
+    openai_key_init, anthropic_key_init, google_key_init = _load_saved_keys()
     # Initial template list = Cursor Workflow (no "all"); user picks category then template.
     default_category = "cursor workflow"
     initial_template_choices = template_dropdown_choices(default_category)
@@ -580,6 +609,11 @@ def build_app() -> gr.Blocks:
                     interactive=False,
                     elem_id="tpl-assembled-prompt",
                 )
+                tpl_pricing_btn = gr.Button(
+                    "💰 Calculate Pricing",
+                    variant="secondary",
+                    size="sm",
+                )
                 tpl_copy_btn = gr.Button(
                     "📋 Copy Prompt to Clipboard",
                     variant="secondary",
@@ -592,7 +626,7 @@ def build_app() -> gr.Blocks:
                 with gr.Accordion("Evaluation Settings (provider & model)", open=False):
                     with gr.Row():
                         tpl_provider = gr.Radio(
-                            choices=["OpenAI", "Anthropic"],
+                            choices=["OpenAI", "Anthropic", "Google"],
                             value="OpenAI",
                             label="Provider",
                         )
@@ -639,7 +673,7 @@ def build_app() -> gr.Blocks:
                                 label="Category",
                             )
                             new_provider = gr.Radio(
-                                choices=["OpenAI", "Anthropic"],
+                                choices=["OpenAI", "Anthropic", "Google"],
                                 value="OpenAI",
                                 label="Provider",
                             )
@@ -674,6 +708,28 @@ def build_app() -> gr.Blocks:
                 )
 
             # ═══════════════════════════════════════════════════════════════
+            # TAB: Token Pricing
+            # ═══════════════════════════════════════════════════════════════
+            with gr.Tab("Token Pricing", id="tab-pricing"):
+                gr.Markdown(
+                    "Enter a prompt to see how many tokens it uses and what it "
+                    "costs across all your configured providers. Only providers "
+                    "with saved API keys are shown."
+                )
+                pricing_prompt_input = gr.Textbox(
+                    label="Prompt",
+                    placeholder="Paste or type a prompt here…",
+                    lines=6,
+                )
+                pricing_calc_btn = gr.Button(
+                    "💰 Calculate Pricing", variant="primary",
+                )
+                pricing_results_html = gr.HTML(
+                    value=EMPTY_PRICING_HTML,
+                    elem_id="pricing-results-panel",
+                )
+
+            # ═══════════════════════════════════════════════════════════════
             # TAB: Settings
             # ═══════════════════════════════════════════════════════════════
             with gr.Tab("Settings", id="tab-settings"):
@@ -694,6 +750,12 @@ def build_app() -> gr.Blocks:
                     type="password",
                     value=anthropic_key_init,
                 )
+                google_key_input = gr.Textbox(
+                    label="Google API Key",
+                    placeholder="AIza…",
+                    type="password",
+                    value=google_key_init,
+                )
                 save_keys_btn = gr.Button("Save API Keys", variant="primary")
                 keys_status = gr.Markdown("")
 
@@ -704,7 +766,7 @@ def build_app() -> gr.Blocks:
         # -- Settings --
         save_keys_btn.click(
             fn=_persist_keys,
-            inputs=[openai_key_input, anthropic_key_input],
+            inputs=[openai_key_input, anthropic_key_input, google_key_input],
             outputs=[keys_status],
         )
 
@@ -813,6 +875,20 @@ def build_app() -> gr.Blocks:
             outputs=[new_refinement_html],
         )
 
+        # -- Token Pricing tab --
+        pricing_calc_btn.click(
+            fn=_handle_calculate_pricing,
+            inputs=[pricing_prompt_input],
+            outputs=[pricing_results_html],
+        )
+
+        # -- Template tab: Calculate Pricing button --
+        tpl_pricing_btn.click(
+            fn=_handle_calculate_pricing,
+            inputs=[tpl_assembled],
+            outputs=[tpl_results_html],
+        )
+
     app._theme = theme
     app._css = APP_CSS
     return app
@@ -827,7 +903,7 @@ def main():
     """Build and launch the Gradio server."""
     app = build_app()
     app.launch(
-        server_name="0.0.0.0",
+        server_name="127.0.0.1",
         server_port=7860,
         theme=app._theme,
         css=app._css,
