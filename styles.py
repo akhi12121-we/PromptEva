@@ -9,12 +9,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from evaluator import METRIC_DEFS
+from evaluator import METRIC_DEFS, OUTPUT_METRIC_DEFS
 
 # ---------------------------------------------------------------------------
 # Quick lookup: metric name -> its definition dict
 # ---------------------------------------------------------------------------
 _METRIC_LOOKUP: dict[str, dict[str, Any]] = {m["name"]: m for m in METRIC_DEFS}
+_OUTPUT_METRIC_LOOKUP: dict[str, dict[str, Any]] = {m["name"]: m for m in OUTPUT_METRIC_DEFS}
 
 # ---------------------------------------------------------------------------
 # CSS
@@ -195,6 +196,30 @@ def build_metric_cards_html() -> str:
     return html
 
 
+def build_output_metric_cards_html() -> str:
+    """Build the HTML grid for output metric definitions."""
+    html = '<div class="metric-grid">'
+    for mdef in OUTPUT_METRIC_DEFS:
+        c = mdef["color"]
+        html += (
+            f'<div class="metric-card" style="border-left:5px solid {c}; background:#f8fafc;">'
+            f'  <div class="mc-icon">{mdef["icon"]}</div>'
+            f'  <div class="mc-name" style="color:{c};">{mdef["name"]}</div>'
+            f'  <div class="mc-question" style="color:#334155;">{mdef["short_def"]}</div>'
+            f'  <div class="mc-desc">{mdef["description"]}</div>'
+            f"</div>"
+        )
+    html += "</div>"
+    html += (
+        '<div class="threshold-legend">'
+        '  <div class="tl-item"><span class="tl-dot" style="background:#16a34a;"></span> >= 80% Strong</div>'
+        '  <div class="tl-item"><span class="tl-dot" style="background:#d97706;"></span> 50–79% Needs work</div>'
+        '  <div class="tl-item"><span class="tl-dot" style="background:#dc2626;"></span> < 50% Problematic</div>'
+        "</div>"
+    )
+    return html
+
+
 # ---------------------------------------------------------------------------
 # Dynamic HTML — evaluation results
 # ---------------------------------------------------------------------------
@@ -272,6 +297,130 @@ def build_results_html(
         mdef = _METRIC_LOOKUP.get(name, {})
         m_icon = mdef.get("icon", "")
         accent = mdef.get("color", "#7c3aed")
+        short = mdef.get("short_def", "")
+        desc = mdef.get("description", "")
+
+        badge_bg = "#dcfce7" if info["passed"] else "#fee2e2"
+        badge_fg = "#15803d" if info["passed"] else "#b91c1c"
+
+        html += f"""
+      <div style="margin-bottom:14px;padding:18px 20px;border-radius:14px;
+                  background:#fff;border:1px solid #e2e8f0;border-left:5px solid {accent};
+                  box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <span style="font-weight:800;font-size:16px;color:{accent};">{m_icon} {name}</span>
+          <span style="color:{badge_fg};font-weight:800;font-size:14px;
+                       background:{badge_bg};padding:4px 14px;border-radius:20px;">
+            {icon} {sc:.0%}
+          </span>
+        </div>
+        <div style="font-size:12.5px;color:#64748b;margin-top:4px;font-style:italic;">{short}</div>
+        <div style="background:#f1f5f9;border-radius:6px;height:10px;margin:12px 0;overflow:hidden;">
+          <div style="background:linear-gradient(90deg,{accent},{sc_color});
+                      width:{bar_w}%;height:100%;border-radius:6px;"></div>
+        </div>
+        <div style="font-size:13.5px;color:#334155;line-height:1.6;margin-bottom:8px;
+                    padding:10px 14px;background:{sc_bg};border-radius:8px;
+                    border-left:3px solid {sc_color};">
+          {info['reason']}
+        </div>
+        <details style="cursor:pointer;margin-top:6px;">
+          <summary style="font-size:12.5px;font-weight:700;color:{accent};">
+            Learn more about this metric
+          </summary>
+          <p style="margin:8px 0 0;font-size:12.5px;color:#64748b;line-height:1.65;
+                    padding:8px 12px;background:#f8fafc;border-radius:8px;">
+            {desc}
+          </p>
+        </details>
+      </div>
+        """
+
+    html += "</div>"
+    return html
+
+
+def build_output_results_html(
+    scores: dict[str, dict],
+    provider: str,
+    elapsed: float,
+    model: str = "",
+    actual_output_preview: str = "",
+) -> str:
+    """Render output evaluation scores as a styled HTML panel.
+
+    Visually distinct from input metrics — uses a teal/blue gradient header
+    so users can instantly tell the sections apart.
+
+    Args:
+        scores:                Dict mapping metric name -> {score, reason, passed}.
+        provider:              "OpenAI", "Anthropic", or "Google".
+        elapsed:               Wall-clock seconds the evaluation took.
+        model:                 Model identifier used for evaluation.
+        actual_output_preview: First 300 chars of the LLM response (shown as preview).
+    """
+    if not scores:
+        return ""
+
+    avg = sum(s["score"] for s in scores.values()) / max(len(scores), 1)
+    avg_color = _score_color(avg)
+    avg_pct = int(avg * 100)
+    model_label = f" / {model}" if model else ""
+    ring = f"background: conic-gradient({avg_color} {avg_pct}%, #e2e8f0 {avg_pct}%);"
+
+    preview_block = ""
+    if actual_output_preview:
+        preview = _escape(actual_output_preview[:300])
+        if len(actual_output_preview) > 300:
+            preview += "…"
+        preview_block = (
+            f'<div style="margin-bottom:18px;padding:14px 18px;border-radius:12px;'
+            f'background:#f0fdfa;border:1px solid #99f6e4;">'
+            f'<div style="font-size:12px;font-weight:700;color:#0d9488;margin-bottom:6px;">'
+            f'LLM RESPONSE PREVIEW</div>'
+            f'<pre style="font-size:12px;color:#134e4a;white-space:pre-wrap;'
+            f'word-break:break-word;margin:0;">{preview}</pre>'
+            f'</div>'
+        )
+
+    html = f"""
+    <div style="font-family:'Inter',system-ui,sans-serif;">
+      <div style="display:flex;align-items:center;gap:20px;margin-bottom:22px;
+                  padding:22px 26px;border-radius:16px;
+                  background:linear-gradient(135deg,#ccfbf1,#cffafe,#e0f2fe);
+                  border:1px solid #67e8f9;box-shadow:0 4px 20px rgba(6,182,212,0.1);">
+        <div style="width:84px;height:84px;border-radius:50%;{ring}
+                    display:flex;align-items:center;justify-content:center;flex-shrink:0;
+                    box-shadow:0 0 0 4px rgba(255,255,255,0.7);">
+          <div style="width:62px;height:62px;border-radius:50%;background:#fff;
+                      display:flex;align-items:center;justify-content:center;
+                      font-size:22px;font-weight:900;color:{avg_color};">
+            {avg_pct}%
+          </div>
+        </div>
+        <div>
+          <div style="font-size:21px;font-weight:800;color:#164e63;">
+            📤 Output Quality Score
+          </div>
+          <div style="color:#6b7280;font-size:13px;margin-top:5px;">
+            Provider: <strong style="color:#0891b2;">{provider}{model_label}</strong>
+            &middot; {elapsed:.1f}s
+          </div>
+        </div>
+      </div>
+      {preview_block}
+    """
+
+    for name, info in scores.items():
+        sc = info["score"]
+        sc_color = _score_color(sc)
+        sc_bg = _score_bg(sc)
+        bar_w = max(int(sc * 100), 2)
+        icon = "✓" if info["passed"] else "✗"
+
+        mdef = _OUTPUT_METRIC_LOOKUP.get(name, {})
+        m_icon = mdef.get("icon", "")
+        accent = mdef.get("color", "#06b6d4")
         short = mdef.get("short_def", "")
         desc = mdef.get("description", "")
 
@@ -674,3 +823,231 @@ def build_pricing_table_html(results: list[dict]) -> str:
 
     html += "</div>"
     return html
+
+
+# ---------------------------------------------------------------------------
+# File analyzer: cost card for a single model
+# ---------------------------------------------------------------------------
+
+
+def build_cost_card_html(
+    model: str,
+    provider: str,
+    tokens: int,
+    input_cost: float,
+    output_cost: float,
+) -> str:
+    """Render a compact cost summary card for a single model selection."""
+    total = input_cost + output_cost
+    provider_colors = {
+        "OpenAI":    ("#10a37f", "#f0fdf4"),
+        "Anthropic": ("#d97706", "#fffbeb"),
+        "Google":    ("#4285f4", "#eff6ff"),
+    }
+    accent, bg = provider_colors.get(provider, ("#7c3aed", "#f5f3ff"))
+
+    return (
+        f'<div style="border-radius:14px;padding:22px 26px;background:{bg};'
+        f'border:2px solid {accent}44;margin-bottom:16px;">'
+        f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">'
+        f'<span style="background:{accent};color:#fff;padding:3px 12px;border-radius:20px;'
+        f'font-size:12px;font-weight:700;">{provider}</span>'
+        f'<span style="color:#0f172a;font-weight:700;font-size:15px;">{model}</span>'
+        f'</div>'
+        f'<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;">'
+        f'<div style="text-align:center;">'
+        f'<div style="font-size:22px;font-weight:900;color:{accent};">{tokens:,}</div>'
+        f'<div style="font-size:11px;color:#64748b;font-weight:600;margin-top:2px;">INPUT TOKENS</div>'
+        f'</div>'
+        f'<div style="text-align:center;">'
+        f'<div style="font-size:22px;font-weight:900;color:#059669;">${input_cost:.6f}</div>'
+        f'<div style="font-size:11px;color:#64748b;font-weight:600;margin-top:2px;">INPUT COST</div>'
+        f'</div>'
+        f'<div style="text-align:center;">'
+        f'<div style="font-size:22px;font-weight:900;color:#d97706;">${output_cost:.6f}</div>'
+        f'<div style="font-size:11px;color:#64748b;font-weight:600;margin-top:2px;">OUTPUT COST*</div>'
+        f'</div>'
+        f'<div style="text-align:center;">'
+        f'<div style="font-size:22px;font-weight:900;color:#7c3aed;">${total:.6f}</div>'
+        f'<div style="font-size:11px;color:#64748b;font-weight:600;margin-top:2px;">TOTAL EST.</div>'
+        f'</div>'
+        f'</div>'
+        f'<div style="margin-top:12px;font-size:11px;color:#94a3b8;">'
+        f'* Output cost estimated assuming response length ≈ input length</div>'
+        f'</div>'
+    )
+
+
+# ---------------------------------------------------------------------------
+# File analyzer: side-by-side comparison panel
+# ---------------------------------------------------------------------------
+
+
+def _avg_score(scores: dict) -> float:
+    """Compute average score from a deepeval results dict."""
+    if not scores:
+        return 0.0
+    vals = [v.get("score", 0.0) for v in scores.values()]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def _delta_token_badge(delta: int) -> str:
+    color = "#059669" if delta < 0 else "#dc2626"
+    sign = "▼" if delta < 0 else "▲"
+    return (
+        f'<span style="background:{color}22;color:{color};padding:2px 10px;'
+        f'border-radius:12px;font-size:12px;font-weight:700;">{sign} {abs(delta):,} tokens</span>'
+    )
+
+
+def _delta_cost_badge(delta: float) -> str:
+    color = "#059669" if delta < 0 else "#dc2626"
+    sign = "▼" if delta < 0 else "▲"
+    return (
+        f'<span style="background:{color}22;color:{color};padding:2px 10px;'
+        f'border-radius:12px;font-size:12px;font-weight:700;">{sign} ${abs(delta):.6f}</span>'
+    )
+
+
+def _score_delta_badge(delta: float) -> str:
+    color = "#059669" if delta >= 0 else "#dc2626"
+    sign = "+" if delta >= 0 else ""
+    return (
+        f'<span style="background:{color}22;color:{color};padding:2px 10px;'
+        f'border-radius:12px;font-size:12px;font-weight:700;">{sign}{delta:.2f}</span>'
+    )
+
+
+def _half_panel(
+    label: str,
+    accent: str,
+    text_preview: str,
+    tokens: int,
+    total_cost: float,
+    avg_score: float,
+    token_delta_html: str = "",
+    cost_delta_html: str = "",
+    score_delta_html: str = "",
+    reason: str = "",
+) -> str:
+    preview = _escape(text_preview[:300]) + ("…" if len(text_preview) > 300 else "")
+    score_color = _score_color(avg_score)
+    score_pct = int(avg_score * 100)
+
+    reason_block = (
+        f'<div style="margin-top:12px;padding:10px 14px;border-radius:8px;'
+        f'background:#f0fdf4;border-left:3px solid #059669;font-size:12px;color:#166534;">'
+        f'<strong>What was trimmed:</strong> {_escape(reason)}</div>'
+        if reason else ""
+    )
+
+    return (
+        f'<div style="flex:1;min-width:280px;border-radius:14px;padding:20px;'
+        f'background:#ffffff;border:2px solid {accent}44;">'
+        f'<div style="font-size:13px;font-weight:800;color:{accent};margin-bottom:14px;'
+        f'text-transform:uppercase;letter-spacing:0.05em;">{label}</div>'
+        f'<pre style="background:#f8fafc;border-radius:8px;padding:12px;font-size:12px;'
+        f'color:#334155;overflow:auto;max-height:160px;white-space:pre-wrap;'
+        f'word-break:break-word;border:1px solid #e2e8f0;">{preview}</pre>'
+        f'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:16px;">'
+        f'<div style="text-align:center;">'
+        f'<div style="font-size:20px;font-weight:900;color:#1e1b4b;">{tokens:,}</div>'
+        f'<div style="font-size:11px;color:#64748b;font-weight:600;">TOKENS</div>'
+        f'<div style="margin-top:4px;">{token_delta_html}</div>'
+        f'</div>'
+        f'<div style="text-align:center;">'
+        f'<div style="font-size:20px;font-weight:900;color:#7c3aed;">${total_cost:.6f}</div>'
+        f'<div style="font-size:11px;color:#64748b;font-weight:600;">TOTAL COST</div>'
+        f'<div style="margin-top:4px;">{cost_delta_html}</div>'
+        f'</div>'
+        f'<div style="text-align:center;">'
+        f'<div style="font-size:20px;font-weight:900;color:{score_color};">{score_pct}%</div>'
+        f'<div style="font-size:11px;color:#64748b;font-weight:600;">QUALITY SCORE</div>'
+        f'<div style="margin-top:4px;">{score_delta_html}</div>'
+        f'</div>'
+        f'</div>'
+        f'{reason_block}'
+        f'</div>'
+    )
+
+
+def build_comparison_html(
+    original_text: str,
+    original_tokens: int,
+    original_input_cost: float,
+    original_output_cost: float,
+    original_scores: dict,
+    alt_text: str,
+    alt_tokens: int,
+    alt_input_cost: float,
+    alt_output_cost: float,
+    alt_scores: dict,
+    reason: str,
+) -> str:
+    """Render a side-by-side comparison: original vs cheaper alternative."""
+    orig_total = original_input_cost + original_output_cost
+    alt_total = alt_input_cost + alt_output_cost
+
+    token_delta = alt_tokens - original_tokens
+    cost_delta = alt_total - orig_total
+    orig_avg = _avg_score(original_scores)
+    alt_avg = _avg_score(alt_scores)
+    score_delta = alt_avg - orig_avg
+
+    tok_badge = _delta_token_badge(token_delta) if token_delta != 0 else ""
+    cost_badge = _delta_cost_badge(cost_delta) if cost_delta != 0 else ""
+    score_badge = _score_delta_badge(score_delta)
+
+    orig_panel = _half_panel(
+        label="Original Prompt",
+        accent="#6366f1",
+        text_preview=original_text,
+        tokens=original_tokens,
+        total_cost=orig_total,
+        avg_score=orig_avg,
+    )
+
+    alt_panel = _half_panel(
+        label="Cheaper Alternative",
+        accent="#059669",
+        text_preview=alt_text,
+        tokens=alt_tokens,
+        total_cost=alt_total,
+        avg_score=alt_avg,
+        token_delta_html=tok_badge,
+        cost_delta_html=cost_badge,
+        score_delta_html=score_badge,
+        reason=reason,
+    )
+
+    savings_pct = (1 - alt_total / orig_total) * 100 if orig_total > 0 else 0
+    summary = ""
+    if token_delta < 0:
+        summary = (
+            f'<div style="padding:14px 20px;background:linear-gradient(135deg,#f0fdf4,#ecfdf5);'
+            f'border-radius:12px;border:1px solid #bbf7d0;margin-bottom:16px;'
+            f'display:flex;align-items:center;gap:16px;flex-wrap:wrap;">'
+            f'<span style="font-size:15px;font-weight:800;color:#166534;">Savings Summary</span>'
+            f'<span style="color:#374151;font-size:13px;">Tokens saved: '
+            f'<strong style="color:#059669;">{abs(token_delta):,}</strong></span>'
+            f'<span style="color:#374151;font-size:13px;">Cost saved: '
+            f'<strong style="color:#059669;">${abs(cost_delta):.6f} ({savings_pct:.1f}%)</strong></span>'
+            f'<span style="color:#374151;font-size:13px;">Quality: '
+            f'<strong style="color:{"#059669" if score_delta >= -0.05 else "#dc2626"};">'
+            f'{"maintained" if score_delta >= -0.05 else "reduced"}</strong></span>'
+            f'</div>'
+        )
+
+    return (
+        f'<div style="margin-top:24px;">'
+        f'<div style="font-size:18px;font-weight:800;color:#1e1b4b;margin-bottom:16px;">'
+        f'Cost vs Quality Comparison</div>'
+        f'{summary}'
+        f'<div style="display:flex;gap:16px;flex-wrap:wrap;">'
+        f'{orig_panel}{alt_panel}'
+        f'</div>'
+        f'<div style="margin-top:16px;font-size:12px;color:#94a3b8;">'
+        f'Quality scores averaged across Clarity, Specificity, Completeness, Coherence, and Safety.'
+        f'</div>'
+        f'</div>'
+    )

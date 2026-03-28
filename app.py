@@ -1,16 +1,16 @@
 """
 PromptAnalyzer — Gradio app for evaluating LLM prompts using DeepEval.
 
-This file is the main orchestrator.  It handles:
-  - Two UI modes: predefined template (guided inputs) and new prompt (full editor)
-  - Prompt persistence (JSON file) and API-key management (.env)
-  - Prompt CRUD operations (user-saved prompts)
-  - Predefined QA template loading (from prompt_library.py)
-  - Gradio UI layout and event wiring
+Tabs:
+  1. Analyze Prompt File  — upload/paste, token cost, INPUT metrics, OUTPUT metrics, cheaper alt
+  2. Write New Prompt     — free-form editor with PROMPT/CROFT framework auto-detection
+  3. Settings             — API key configuration
 
-Evaluation logic lives in evaluator.py.
-Predefined templates live in prompt_library.py.
-All CSS and HTML rendering lives in styles.py.
+Evaluation logic      → evaluator.py
+Prompt builder        → prompt_builder.py
+Pricing config        → config/pricing.py
+Suggestion engine     → services/suggestion_engine.py
+CSS + HTML rendering  → styles.py
 
 Run:
     uv run python app.py
@@ -18,24 +18,29 @@ Run:
 
 from __future__ import annotations
 
-import json
 import os
+import tempfile
 import time
 import traceback
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import gradio as gr
 from dotenv import load_dotenv
 
-from evaluator import (
+from config.pricing import (
+    ALL_MODELS,
     ANTHROPIC_MODELS,
     GOOGLE_MODELS,
+    MODEL_DISPLAY_NAMES,
+    MODEL_PRICING,
     OPENAI_MODELS,
-    calculate_token_pricing,
-    refine_prompt,
+    PROVIDER_FOR_MODEL,
+)
+from evaluator import (
+    generate_prompt_response,
     run_evaluation,
+    run_output_evaluation,
 )
 from prompt_builder import (
     build_prompt,
@@ -43,64 +48,27 @@ from prompt_builder import (
     render_detection_badge,
     render_empty_badge,
 )
-from prompt_library import (
-    CATEGORIES,
-    VISIBLE_CATEGORIES,
-    assemble_prompt,
-    get_all_templates,
-    get_templates_by_category,
-    template_dropdown_choices,
-)
+from services.suggestion_engine import generate_cheaper_alternative
 from styles import (
     APP_CSS,
-    EMPTY_PRICING_HTML,
-    EMPTY_REFINEMENT_HTML,
     EMPTY_RESULTS_HTML,
     HEADER_HTML,
+    build_comparison_html,
+    build_cost_card_html,
     build_metric_cards_html,
-    build_pricing_table_html,
-    build_refinement_html,
+    build_output_metric_cards_html,
+    build_output_results_html,
     build_results_html,
-    build_template_description_html,
 )
 
-PROMPTS_FILE = Path("prompts.json")
 ENV_FILE = Path(".env")
 
-# Number of always-rendered input fields in the template tab.
-# Set to the max input count across visible templates (currently 3).
-MAX_TEMPLATE_INPUTS = 3
-
 # ---------------------------------------------------------------------------
-# Persistence helpers
+# API key helpers
 # ---------------------------------------------------------------------------
-
-
-def _load_prompts() -> list[dict[str, Any]]:
-    """Read saved prompts from the JSON file.
-
-    Returns:
-        List of prompt dicts, or empty list if file is missing / corrupt.
-    """
-    if PROMPTS_FILE.exists():
-        try:
-            return json.loads(PROMPTS_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
-            return []
-    return []
-
-
-def _save_prompts(prompts: list[dict[str, Any]]) -> None:
-    """Write the full prompts list to disk as pretty-printed JSON."""
-    PROMPTS_FILE.write_text(json.dumps(prompts, indent=2, default=str))
 
 
 def _load_saved_keys() -> tuple[str, str, str]:
-    """Load API keys from .env into the environment.
-
-    Returns:
-        Tuple of (openai_key, anthropic_key, google_key) — empty strings if unset.
-    """
     load_dotenv(ENV_FILE, override=True)
     return (
         os.getenv("OPENAI_API_KEY", ""),
@@ -110,11 +78,6 @@ def _load_saved_keys() -> tuple[str, str, str]:
 
 
 def _persist_keys(openai_key: str, anthropic_key: str, google_key: str) -> str:
-    """Validate API keys, write them to .env, and load into os.environ.
-
-    Returns:
-        A user-facing status message (success or error).
-    """
     openai_key = openai_key.strip()
     anthropic_key = anthropic_key.strip()
     google_key = google_key.strip()
@@ -148,325 +111,219 @@ def _persist_keys(openai_key: str, anthropic_key: str, google_key: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# User prompt CRUD
+# File loading
+# ---------------------------------------------------------------------------
+
+SUPPORTED_EXTENSIONS = {".md", ".txt", ".py", ".yaml", ".yml", ".json"}
+
+
+def _load_prompt_text(uploaded_file: Any, pasted_text: str) -> tuple[str, str]:
+    """Resolve prompt text from whichever input was used.
+
+    Priority: uploaded file → pasted text.
+    Returns: (text, error_message)
+    """
+    if uploaded_file is not None:
+        try:
+            path = Path(
+                uploaded_file if isinstance(uploaded_file, str) else uploaded_file.name
+            )
+            return path.read_text(encoding="utf-8", errors="replace"), ""
+        except Exception as exc:
+            return "", f"Could not read uploaded file: {exc}"
+
+    if pasted_text and pasted_text.strip():
+        return pasted_text.strip(), ""
+
+    return "", "Please upload a file or paste content."
+
+
+# ---------------------------------------------------------------------------
+# Token pricing (inline, no separate tab)
 # ---------------------------------------------------------------------------
 
 
-def _prompt_choices(prompts: list[dict]) -> list[str]:
-    """Build display labels for the sidebar dropdown."""
-    return [
-        f"[{i}] {p.get('title', p.get('text', '')[:40])}"
-        for i, p in enumerate(prompts)
-    ]
+def _count_tokens_single(text: str, model: str) -> int:
+    import tiktoken
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except KeyError:
+        enc = tiktoken.get_encoding("o200k_base")
+    return len(enc.encode(text))
 
 
-def save_prompt(
-    title: str, text: str, category: str, prompts_state: list[dict]
-) -> tuple[list[dict], list[str], str]:
-    """Append a new prompt to the user's library and persist to disk."""
-    if not text.strip():
-        return prompts_state, _prompt_choices(prompts_state), "⚠ Prompt text cannot be empty."
-
-    entry = {
-        "title": title.strip() or text.strip()[:40],
-        "text": text.strip(),
-        "category": category,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "evaluations": [],
+def _pricing_for_model(text: str, model: str) -> dict[str, Any]:
+    pricing = MODEL_PRICING[model]
+    tokens = _count_tokens_single(text, model)
+    return {
+        "model": model,
+        "provider": PROVIDER_FOR_MODEL[model],
+        "tokens": tokens,
+        "input_cost": round(tokens * pricing["input"] / 1_000_000, 6),
+        "output_cost": round(tokens * pricing["output"] / 1_000_000, 6),
     }
-    prompts_state.append(entry)
-    _save_prompts(prompts_state)
-    return (
-        prompts_state,
-        _prompt_choices(prompts_state),
-        f"✓ Prompt saved ({len(prompts_state)} total).",
-    )
 
 
-def delete_prompt(
-    selected_label: str, prompts_state: list[dict]
-) -> tuple[list[dict], list[str], str]:
-    """Remove the selected prompt from the user's library."""
-    if not selected_label:
-        return prompts_state, _prompt_choices(prompts_state), "⚠ No prompt selected."
-
-    idx = int(selected_label.split("]")[0].replace("[", ""))
-    removed = prompts_state.pop(idx)
-    _save_prompts(prompts_state)
-    return (
-        prompts_state,
-        _prompt_choices(prompts_state),
-        f"✓ Deleted: {removed.get('title', 'Untitled')}",
-    )
+# ---------------------------------------------------------------------------
+# Main analysis pipeline
+# ---------------------------------------------------------------------------
 
 
-def load_selected_prompt(
-    selected_label: str, prompts_state: list[dict]
+def analyze_prompt(
+    uploaded_file: Any,
+    pasted_text: str,
+    selected_model: str,
 ) -> tuple[str, str, str, str]:
-    """Populate the new-prompt editor fields from a user-saved prompt."""
-    if not selected_label:
-        return "", "", "cursor prompt", ""
+    """Full analysis pipeline.
 
-    idx = int(selected_label.split("]")[0].replace("[", ""))
-    p = prompts_state[idx]
-
-    history = ""
-    for ev in p.get("evaluations", []):
-        history += f"--- {ev.get('timestamp', '?')} | {ev.get('provider', '?')} ---\n"
-        for m, info in ev.get("scores", {}).items():
-            history += f"  {m}: {info['score']:.2f} — {info['reason']}\n"
-        history += "\n"
-
-    return p.get("title", ""), p.get("text", ""), p.get("category", "cursor prompt"), history
-
-
-# ---------------------------------------------------------------------------
-# Template mode handlers
-# ---------------------------------------------------------------------------
-
-
-def _find_template_by_title(title: str) -> dict[str, Any] | None:
-    """Look up a template by its display title."""
-    if not title:
-        return None
-    for t in get_all_templates():
-        if t["title"] == title:
-            return t
-    return None
-
-
-_CATEGORY_MAP = {
-    "Cursor Workflow": "cursor workflow",
-    "Analysis": "analysis",
-}
-
-
-def _filter_templates(category_label: str):
-    """Update the template dropdown when the category filter changes.
-
-    Maps display labels ("Cursor Workflow", "Analysis") to internal category values.
-    Returns updates for the template dropdown only; the .change on the dropdown
-    will fire _on_template_selected for the first item.
-    """
-    cat = _CATEGORY_MAP.get(category_label, category_label)
-    choices = template_dropdown_choices(cat)
-    first = choices[0] if choices else None
-    return gr.update(choices=choices, value=first)
-
-
-def _on_template_selected(template_title: str):
-    """When a template is selected, update input field labels/hints and clear values.
-
-    Returns updates for: description_html, assembled_prompt (cleared),
-    and MAX_TEMPLATE_INPUTS input fields (label + placeholder updates).
-    """
-    t = _find_template_by_title(template_title)
-
-    if not t:
-        updates = [
-            gr.update(value=""),
-            gr.update(value=""),
-            gr.update(visible=True, label="Select a template above, then type here",
-                      placeholder="...", value=""),
-        ]
-        for _ in range(MAX_TEMPLATE_INPUTS - 1):
-            updates.append(gr.update(visible=False, value=""))
-        return updates
-
-    desc_html = build_template_description_html(t["description"], [])
-    updates = [
-        gr.update(value=desc_html),
-        gr.update(value=""),
-    ]
-
-    inputs_meta = t.get("inputs", [])
-    for i in range(MAX_TEMPLATE_INPUTS):
-        if i < len(inputs_meta):
-            inp = inputs_meta[i]
-            updates.append(gr.update(
-                visible=True,
-                label=inp["label"],
-                placeholder=inp["hint"],
-                value="",
-                lines=inp.get("lines", 2),
-            ))
-        else:
-            updates.append(gr.update(visible=False, value=""))
-
-    return updates
-
-
-def _extract_user_values(template_title: str, input_values: list[str]) -> tuple[dict | None, str, str]:
-    """Validate inputs and build user_values dict from template + filled fields.
-
-    Inputs marked optional in the template may be empty; they are passed as empty string.
+    Steps:
+        1. Load prompt text
+        2. Token count + pricing (cost card)
+        3. INPUT evaluation  — score the prompt quality
+        4. Generate LLM response
+        5. OUTPUT evaluation — score the response quality
+        6. Generate cheaper alternative + comparison
 
     Returns:
-        (user_values_dict, assembled_prompt, error_message)
-        If error, user_values is None.
+        (cost_html, input_quality_html, output_quality_html, comparison_html)
     """
-    t = _find_template_by_title(template_title)
-    if not t:
-        return None, "", "Please select a template first."
-
-    inputs_meta = t.get("inputs", [])
-    user_values = {}
-    for i, meta in enumerate(inputs_meta):
-        val = input_values[i] if i < len(input_values) else ""
-        val = (val or "").strip()
-        if not val and not meta.get("optional", False):
-            return None, "", f"Please fill in: {meta['label']}"
-        user_values[meta["key"]] = val if val else ""
-
-    return user_values, assemble_prompt(t["id"], user_values), ""
-
-
-def _generate_assembled_prompt(template_title: str, *input_values):
-    """Assemble the prompt from template + user inputs and show it read-only.
-
-    Returns the assembled prompt string for the textbox.
-    """
-    vals = list(input_values[:MAX_TEMPLATE_INPUTS])
-    user_values, prompt, err = _extract_user_values(template_title, vals)
+    text, err = _load_prompt_text(uploaded_file, pasted_text)
     if err:
-        return f"⚠ {err}"
-    return prompt
+        error_html = f"<p style='color:#dc2626;font-weight:600;'>{err}</p>"
+        return error_html, "", "", ""
 
+    provider = PROVIDER_FOR_MODEL.get(selected_model, "OpenAI")
 
-def _assemble_and_evaluate(template_title: str, *input_values_and_rest):
-    """Assemble prompt from template + user inputs, then run evaluation.
+    # ── Step 1: Token cost card ────────────────────────────────────────────
+    orig_pricing = _pricing_for_model(text, selected_model)
+    cost_html = build_cost_card_html(
+        model=selected_model,
+        provider=provider,
+        tokens=orig_pricing["tokens"],
+        input_cost=orig_pricing["input_cost"],
+        output_cost=orig_pricing["output_cost"],
+    )
 
-    Args order: input_0..input_4, provider, model, prompts_state.
-    """
-    input_values = list(input_values_and_rest[:MAX_TEMPLATE_INPUTS])
-    provider = input_values_and_rest[MAX_TEMPLATE_INPUTS]
-    model = input_values_and_rest[MAX_TEMPLATE_INPUTS + 1]
-    prompts_state = input_values_and_rest[MAX_TEMPLATE_INPUTS + 2]
-
-    user_values, final_prompt, err = _extract_user_values(template_title, input_values)
-    if err:
-        return (
-            f"<p style='color:#dc2626;font-weight:600;'>{err}</p>",
-            prompts_state,
-        )
-
-    t = _find_template_by_title(template_title)
+    # ── Step 2: INPUT evaluation (prompt quality) ──────────────────────────
     start = time.time()
+    input_scores: dict = {}
     try:
-        scores = run_evaluation(final_prompt, provider, model)
+        input_scores = run_evaluation(text, provider, selected_model)
     except Exception as exc:
         tb = traceback.format_exc()
-        return (
-            f"<pre style='color:#dc2626;'>Evaluation failed:\n{exc}\n\n{tb}</pre>",
-            prompts_state,
+        cost_html += (
+            f"<pre style='color:#dc2626;font-size:12px;'>"
+            f"Input evaluation failed:\n{exc}\n\n{tb}</pre>"
         )
-    elapsed = time.time() - start
+    input_elapsed = time.time() - start
 
-    evaluation_record = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "provider": provider,
-        "model": model,
-        "template": t["title"],
-        "scores": scores,
-    }
+    input_quality_html = (
+        build_results_html(input_scores, provider, input_elapsed, selected_model)
+        if input_scores else ""
+    )
 
-    prompts_state.append({
-        "title": f"[Template] {t['title']}",
-        "text": final_prompt,
-        "category": t["category"],
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "evaluations": [evaluation_record],
-    })
-    _save_prompts(prompts_state)
-    return build_results_html(scores, provider, elapsed, model), prompts_state
-
-
-def _assemble_and_refine(template_title: str, *input_values_and_rest):
-    """Assemble prompt from template + user inputs, then run refinement."""
-    input_values = list(input_values_and_rest[:MAX_TEMPLATE_INPUTS])
-    provider = input_values_and_rest[MAX_TEMPLATE_INPUTS]
-    model = input_values_and_rest[MAX_TEMPLATE_INPUTS + 1]
-
-    user_values, final_prompt, err = _extract_user_values(template_title, input_values)
-    if err:
-        return f"<p style='color:#dc2626;font-weight:600;'>{err}</p>"
-
+    # ── Step 3: Generate actual LLM response ───────────────────────────────
+    response_text = ""
     try:
-        raw = refine_prompt(final_prompt, provider, model)
-        return build_refinement_html(raw)
+        response_text = generate_prompt_response(text, provider, selected_model)
+    except Exception as exc:
+        response_text = f"[Could not generate response: {exc}]"
+
+    # ── Step 4: OUTPUT evaluation (response quality) ───────────────────────
+    start = time.time()
+    output_scores: dict = {}
+    try:
+        output_scores = run_output_evaluation(text, response_text, provider, selected_model)
     except Exception as exc:
         tb = traceback.format_exc()
-        return f"<pre style='color:#dc2626;'>Refinement failed:\n{exc}\n\n{tb}</pre>"
+        output_scores = {}
+        cost_html += (
+            f"<pre style='color:#dc2626;font-size:12px;'>"
+            f"Output evaluation failed:\n{exc}\n\n{tb}</pre>"
+        )
+    output_elapsed = time.time() - start
+
+    output_quality_html = (
+        build_output_results_html(
+            output_scores,
+            provider,
+            output_elapsed,
+            selected_model,
+            actual_output_preview=response_text,
+        )
+        if output_scores else ""
+    )
+
+    # ── Step 5: Cheaper alternative + comparison ───────────────────────────
+    try:
+        alt_text, reason = generate_cheaper_alternative(text, provider, selected_model)
+    except Exception as exc:
+        alt_text, reason = text, f"Could not generate alternative: {exc}"
+
+    alt_pricing = _pricing_for_model(alt_text, selected_model)
+    alt_scores: dict = {}
+    try:
+        alt_scores = run_evaluation(alt_text, provider, selected_model)
+    except Exception:
+        pass
+
+    comparison_html = build_comparison_html(
+        original_text=text,
+        original_tokens=orig_pricing["tokens"],
+        original_input_cost=orig_pricing["input_cost"],
+        original_output_cost=orig_pricing["output_cost"],
+        original_scores=input_scores,
+        alt_text=alt_text,
+        alt_tokens=alt_pricing["tokens"],
+        alt_input_cost=alt_pricing["input_cost"],
+        alt_output_cost=alt_pricing["output_cost"],
+        alt_scores=alt_scores,
+        reason=reason,
+    )
+
+    return cost_html, input_quality_html, output_quality_html, comparison_html
 
 
 # ---------------------------------------------------------------------------
-# New prompt mode handlers
+# Write New Prompt handlers
 # ---------------------------------------------------------------------------
 
 
 def evaluate_new_prompt(
     title: str, text: str, category: str, provider: str, model: str,
-    prompts_state: list[dict],
-) -> tuple[str, list[dict]]:
-    """Run DeepEval metrics on a user-written prompt, render results, persist."""
+) -> str:
     if not text.strip():
-        return (
-            "<p style='color:#dc2626;font-weight:600;'>Please enter a prompt to evaluate.</p>",
-            prompts_state,
-        )
+        return "<p style='color:#dc2626;font-weight:600;'>Please enter a prompt to evaluate.</p>"
 
     start = time.time()
     try:
         scores = run_evaluation(text.strip(), provider, model)
     except Exception as exc:
         tb = traceback.format_exc()
-        return (
-            f"<pre style='color:#dc2626;'>Evaluation failed:\n{exc}\n\n{tb}</pre>",
-            prompts_state,
-        )
+        return f"<pre style='color:#dc2626;'>Evaluation failed:\n{exc}\n\n{tb}</pre>"
+
     elapsed = time.time() - start
-
-    evaluation_record = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "provider": provider,
-        "model": model,
-        "scores": scores,
-    }
-
-    matched = False
-    for p in prompts_state:
-        if p.get("text", "").strip() == text.strip():
-            p.setdefault("evaluations", []).append(evaluation_record)
-            matched = True
-            break
-
-    if not matched:
-        prompts_state.append({
-            "title": title.strip() or text.strip()[:40],
-            "text": text.strip(),
-            "category": category,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "evaluations": [evaluation_record],
-        })
-
-    _save_prompts(prompts_state)
-    return build_results_html(scores, provider, elapsed, model), prompts_state
+    return build_results_html(scores, provider, elapsed, model)
 
 
-def handle_refine_new(text: str, provider: str, model: str) -> str:
-    """Call the LLM to refine a user-written prompt."""
+def save_prompt_as_txt(title: str, text: str) -> tuple[str | None, str]:
+    """Write prompt to a .txt file and return (path, status_message)."""
     if not text.strip():
-        return "<p style='color:#dc2626;font-weight:600;'>Please enter a prompt first.</p>"
-    try:
-        raw = refine_prompt(text.strip(), provider, model)
-        return build_refinement_html(raw)
-    except Exception as exc:
-        tb = traceback.format_exc()
-        return f"<pre style='color:#dc2626;'>Refinement failed:\n{exc}\n\n{tb}</pre>"
+        return None, "⚠ Prompt text is empty."
+    safe_name = "".join(
+        c if c.isalnum() or c in "_ -" else "_"
+        for c in (title.strip() or "prompt")
+    )[:60] or "prompt"
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", prefix=f"{safe_name}_",
+        delete=False, encoding="utf-8",
+    )
+    tmp.write(text.strip())
+    tmp.close()
+    return tmp.name, "✓ Ready to download."
 
 
 def _update_model_choices(provider: str):
-    """Return the model list matching the selected provider."""
     if provider == "OpenAI":
         return gr.update(choices=OPENAI_MODELS, value=OPENAI_MODELS[0])
     if provider == "Google":
@@ -474,41 +331,42 @@ def _update_model_choices(provider: str):
     return gr.update(choices=ANTHROPIC_MODELS, value=ANTHROPIC_MODELS[0])
 
 
-def _handle_calculate_pricing(prompt_text: str) -> str:
-    """Calculate token counts and pricing for all configured providers.
-
-    Returns:
-        Styled HTML table with token counts and costs.
-    """
-    if not prompt_text or not prompt_text.strip():
-        return "<p style='color:#dc2626;font-weight:600;'>Please enter a prompt first.</p>"
-    try:
-        results = calculate_token_pricing(prompt_text.strip())
-        return build_pricing_table_html(results)
-    except Exception as exc:
-        tb = traceback.format_exc()
-        return f"<pre style='color:#dc2626;'>Pricing calculation failed:\n{exc}\n\n{tb}</pre>"
-
-
 # ---------------------------------------------------------------------------
 # UI layout
 # ---------------------------------------------------------------------------
 
+_ANALYZER_CHOICES = [MODEL_DISPLAY_NAMES[m] for m in ALL_MODELS]
+_DISPLAY_TO_MODEL = {v: k for k, v in MODEL_DISPLAY_NAMES.items()}
+
+# Highlighted section header HTML
+_INPUT_HEADER = (
+    '<div style="display:flex;align-items:center;gap:12px;padding:14px 20px;'
+    'border-radius:12px;background:linear-gradient(135deg,#ede9fe,#dbeafe);'
+    'border:1px solid #c4b5fd;margin-bottom:16px;">'
+    '<span style="font-size:22px;">📥</span>'
+    '<div>'
+    '<div style="font-size:15px;font-weight:800;color:#4c1d95;">Input Evaluator</div>'
+    '<div style="font-size:12px;color:#6b7280;margin-top:2px;">'
+    'Scores the <strong>prompt itself</strong> — Clarity · Specificity · Completeness · Coherence · Safety'
+    '</div></div></div>'
+)
+_OUTPUT_HEADER = (
+    '<div style="display:flex;align-items:center;gap:12px;padding:14px 20px;'
+    'border-radius:12px;background:linear-gradient(135deg,#ccfbf1,#cffafe);'
+    'border:1px solid #67e8f9;margin-bottom:16px;">'
+    '<span style="font-size:22px;">📤</span>'
+    '<div>'
+    '<div style="font-size:15px;font-weight:800;color:#164e63;">Output Evaluator</div>'
+    '<div style="font-size:12px;color:#6b7280;margin-top:2px;">'
+    'Scores the <strong>LLM\'s response</strong> — Answer Relevancy · Hallucination · Bias · Toxicity · Conciseness · Context Precision'
+    '</div></div></div>'
+)
+
 
 def build_app() -> gr.Blocks:
-    """Construct the Gradio Blocks application with two-mode Evaluate tab."""
-    saved_prompts = _load_prompts()
-    openai_key_init, anthropic_key_init, google_key_init = _load_saved_keys()
-    # Initial template list = Cursor Workflow (no "all"); user picks category then template.
-    default_category = "cursor workflow"
-    initial_template_choices = template_dropdown_choices(default_category)
-    # First template as default so dropdown has a valid selection (fixes Gradio dropdown selection).
-    first_template_value = initial_template_choices[0] if initial_template_choices else None
+    from prompt_library import CATEGORIES as PROMPT_CATEGORIES
 
-    # Pre-compute initial state for the first template so we don't need app.load().
-    _init_tpl = _find_template_by_title(first_template_value) if first_template_value else None
-    _init_desc = build_template_description_html(_init_tpl["description"], []) if _init_tpl else ""
-    _init_inputs = _init_tpl.get("inputs", []) if _init_tpl else []
+    openai_key_init, anthropic_key_init, google_key_init = _load_saved_keys()
 
     theme = gr.themes.Soft(
         primary_hue="violet",
@@ -519,155 +377,79 @@ def build_app() -> gr.Blocks:
 
     with gr.Blocks(title="PromptAnalyzer") as app:
 
-        prompts_state = gr.State(saved_prompts)
-
-        # ── Sidebar: user-saved prompts ──
-        with gr.Sidebar(label="My Saved Prompts"):
-            gr.Markdown("### My Prompts")
-            prompt_selector = gr.Dropdown(
-                choices=_prompt_choices(saved_prompts),
-                label="Select a saved prompt",
-                interactive=True,
-            )
-            load_btn = gr.Button("Load Selected", variant="secondary", size="sm")
-            delete_btn = gr.Button("Delete Selected", variant="stop", size="sm")
-            sidebar_status = gr.Markdown("")
-
-        # ── Header ──
         gr.HTML(HEADER_HTML)
 
-        # ── Metric definitions ──
-        with gr.Accordion("What do the metrics mean?  (click to expand)", open=False):
+        # ── Metric definitions (two accordions: input + output) ───────────
+        with gr.Accordion("📥 Input Metrics — what do they mean?  (click to expand)", open=False):
             gr.HTML(build_metric_cards_html())
 
-        # ── Main tabs ──
+        with gr.Accordion("📤 Output Metrics — what do they mean?  (click to expand)", open=False):
+            gr.HTML(build_output_metric_cards_html())
+
         with gr.Tabs():
 
             # ═══════════════════════════════════════════════════════════════
-            # TAB: Cursor Prompts (guided mode — user fills context fields,
-            #       assembled prompt shown read-only for copy to Cursor)
+            # TAB 1: Analyze Prompt File
             # ═══════════════════════════════════════════════════════════════
-            with gr.Tab("Cursor Prompts", id="tab-template"):
+            with gr.Tab("Analyze Prompt File", id="tab-analyze"):
                 gr.Markdown(
-                    "Select a template, fill in the context fields, and click **Generate Prompt**. "
-                    "The assembled prompt appears below — ready to copy into Cursor."
+                    "Upload a file or paste content, pick a model, and click **Analyze**. "
+                    "You'll get token cost, prompt quality scores **(Input Evaluator)**, "
+                    "response quality scores **(Output Evaluator)**, and a cheaper alternative."
                 )
 
-                with gr.Row():
-                    tpl_category_filter = gr.Dropdown(
-                        choices=["Cursor Workflow", "Analysis"],
-                        value="Cursor Workflow",
-                        label="Filter by Category",
-                        scale=1,
-                        interactive=True,
-                    )
-                    tpl_dropdown = gr.Dropdown(
-                        choices=initial_template_choices,
-                        value=first_template_value,
-                        label="Select a Template",
-                        scale=2,
-                        interactive=True,
-                    )
-
-                tpl_description = gr.HTML(value=_init_desc)
-
-                # Input fields pre-populated from the default template.
-                _i0 = _init_inputs[0] if len(_init_inputs) > 0 and isinstance(_init_inputs[0], dict) else None
-                _i1 = _init_inputs[1] if len(_init_inputs) > 1 and isinstance(_init_inputs[1], dict) else None
-                _i2 = _init_inputs[2] if len(_init_inputs) > 2 and isinstance(_init_inputs[2], dict) else None
-
-                tpl_input_0 = gr.Textbox(
-                    label=_i0["label"] if _i0 else "Select a template above, then type here",
-                    placeholder=_i0["hint"] if _i0 else "...",
-                    lines=_i0.get("lines", 4) if _i0 else 4,
-                    interactive=True,
-                    visible=True,
-                )
-                tpl_input_1 = gr.Textbox(
-                    label=_i1["label"] if _i1 else "",
-                    placeholder=_i1["hint"] if _i1 else "",
-                    lines=_i1.get("lines", 2) if _i1 else 2,
-                    interactive=True,
-                    visible=bool(_i1),
-                )
-                tpl_input_2 = gr.Textbox(
-                    label=_i2["label"] if _i2 else "",
-                    placeholder=_i2["hint"] if _i2 else "",
-                    lines=_i2.get("lines", 2) if _i2 else 2,
-                    interactive=True,
-                    visible=bool(_i2),
-                )
-
-                tpl_inputs = [tpl_input_0, tpl_input_1, tpl_input_2]
-
-                with gr.Row():
-                    tpl_generate_btn = gr.Button(
-                        "Generate Prompt", variant="primary",
-                    )
-                    tpl_evaluate_btn = gr.Button("Evaluate Prompt", variant="secondary")
-                    tpl_refine_btn = gr.Button("Refine Prompt", variant="secondary")
-
-                # Read-only assembled prompt for copying into Cursor
-                tpl_assembled = gr.Textbox(
-                    label="Your Cursor Prompt (read-only — copy this into Cursor)",
-                    value="",
-                    lines=12,
-                    interactive=False,
-                    elem_id="tpl-assembled-prompt",
-                )
-                tpl_pricing_btn = gr.Button(
-                    "💰 Calculate Pricing",
-                    variant="secondary",
-                    size="sm",
-                )
-                tpl_copy_btn = gr.Button(
-                    "📋 Copy Prompt to Clipboard",
-                    variant="secondary",
-                    size="sm",
-                    elem_id="tpl-copy-btn",
-                )
-
-                # Provider / model hidden by default — only needed for
-                # Evaluate and Refine, not for Generate + Copy workflow.
-                with gr.Accordion("Evaluation Settings (provider & model)", open=False):
-                    with gr.Row():
-                        tpl_provider = gr.Radio(
-                            choices=["OpenAI", "Anthropic", "Google"],
-                            value="OpenAI",
-                            label="Provider",
+                with gr.Tabs():
+                    with gr.Tab("Upload File"):
+                        file_upload = gr.File(
+                            label="Drag & drop or click to upload (.md .txt .py .yaml .json)",
+                            file_types=[".md", ".txt", ".py", ".yaml", ".yml", ".json"],
+                            file_count="single",
                         )
-                        tpl_model = gr.Dropdown(
-                            choices=OPENAI_MODELS,
-                            value=OPENAI_MODELS[0],
-                            label="Model",
+                    with gr.Tab("Paste Content"):
+                        paste_input = gr.Textbox(
+                            label="Paste prompt / agent / skill content here",
+                            placeholder="Paste any text content…",
+                            lines=10,
                         )
 
-                tpl_results_html = gr.HTML(
-                    value="",
-                    elem_id="tpl-results-panel",
-                )
-
-                with gr.Accordion("AI Prompt Refinement", open=False):
-                    tpl_refinement_html = gr.HTML(
-                        value=EMPTY_REFINEMENT_HTML,
-                        elem_id="tpl-refinement-panel",
+                with gr.Row():
+                    model_selector = gr.Dropdown(
+                        choices=_ANALYZER_CHOICES,
+                        value=_ANALYZER_CHOICES[0],
+                        label="Model — controls tokenizer, pricing, and which AI judge runs evaluations",
+                        scale=3,
+                        interactive=True,
                     )
+                    analyze_btn = gr.Button("Analyze", variant="primary", scale=1)
+
+                # Cost card
+                analyze_cost_html = gr.HTML(value="", elem_id="analyze-cost-panel")
+
+                # Input evaluator section
+                gr.HTML(_INPUT_HEADER)
+                analyze_input_html = gr.HTML(value="", elem_id="analyze-input-panel")
+
+                # Output evaluator section
+                gr.HTML(_OUTPUT_HEADER)
+                analyze_output_html = gr.HTML(value="", elem_id="analyze-output-panel")
+
+                # Comparison panel
+                analyze_comparison_html = gr.HTML(value="", elem_id="analyze-comparison-panel")
 
             # ═══════════════════════════════════════════════════════════════
-            # TAB: Write New Prompt (full editor mode)
+            # TAB 2: Write New Prompt
             # ═══════════════════════════════════════════════════════════════
             with gr.Tab("Write New Prompt", id="tab-new-prompt"):
                 gr.Markdown(
                     "Describe your goal — the **PROMPT** or **CROFT** framework is "
-                    "auto-detected from your input. Click **Build Structured Prompt** to "
-                    "generate a well-formed prompt, then evaluate or refine it."
+                    "auto-detected. Click **Build Structured Prompt**, then evaluate it."
                 )
 
-                # ── Prompt Builder (top section) ──────────────────────────
                 with gr.Group(elem_classes=["prompt-builder-section"]):
                     gr.HTML(
                         '<div class="section-title">'
-                        "🧠 Prompt Builder (AI Fluency) — 4D Principles (Delegation · Description · Discernment · Diligence)"
+                        "🧠 Prompt Builder — 4D Principles "
+                        "(Delegation · Description · Discernment · Diligence)"
                         "</div>"
                     )
                     new_idea = gr.Textbox(
@@ -677,10 +459,7 @@ def build_app() -> gr.Blocks:
                             "or 'Explain the difference between REST and GraphQL APIs'"
                         ),
                         lines=3,
-                        info=(
-                            "Describe your intent in plain language. "
-                            "The framework is selected automatically — no LLM call needed."
-                        ),
+                        info="Framework is auto-detected — no LLM call needed.",
                     )
                     new_framework_badge = gr.HTML(value=render_empty_badge())
                     with gr.Row():
@@ -695,116 +474,63 @@ def build_app() -> gr.Blocks:
                             ),
                         )
                         new_build_btn = gr.Button(
-                            "✨ Build Structured Prompt",
-                            variant="primary",
-                            scale=0,
+                            "✨ Build Structured Prompt", variant="primary", scale=0,
                         )
 
-                # ── Full editor + evaluation ──────────────────────────────
                 with gr.Row():
                     with gr.Column(scale=1):
                         new_title = gr.Textbox(
-                            label="Prompt Title",
-                            placeholder="My awesome prompt…",
-                            max_lines=1,
+                            label="Prompt Title", placeholder="My awesome prompt…", max_lines=1,
                         )
                         new_text = gr.Textbox(
                             label="Prompt Text",
-                            placeholder=(
-                                "Your structured prompt will appear here after clicking "
-                                "'Build Structured Prompt', or write directly from scratch…"
-                            ),
+                            placeholder="Your structured prompt appears here…",
                             lines=12,
                         )
                         with gr.Row():
                             new_category = gr.Dropdown(
-                                choices=CATEGORIES,
-                                value="cursor prompt",
-                                label="Category",
+                                choices=PROMPT_CATEGORIES, value="cursor prompt", label="Category",
                             )
                             new_provider = gr.Radio(
                                 choices=["OpenAI", "Anthropic", "Google"],
-                                value="OpenAI",
-                                label="Provider",
+                                value="OpenAI", label="Provider",
                             )
                         new_model = gr.Dropdown(
-                            choices=OPENAI_MODELS,
-                            value=OPENAI_MODELS[0],
-                            label="Model",
+                            choices=OPENAI_MODELS, value=OPENAI_MODELS[0], label="Model",
                         )
                         with gr.Row():
                             new_evaluate_btn = gr.Button("Evaluate Prompt", variant="primary")
-                            new_refine_btn = gr.Button("Refine Prompt", variant="secondary")
-                            new_save_btn = gr.Button("Save to My Prompts", variant="secondary")
+                            new_save_btn = gr.Button("💾 Save as .txt", variant="secondary")
                         new_status = gr.Markdown("")
-
-                    with gr.Column(scale=1):
-                        gr.Markdown("### Evaluation Results")
-                        new_results_html = gr.HTML(
-                            value=EMPTY_RESULTS_HTML,
-                            elem_id="new-results-panel",
+                        new_download = gr.File(
+                            label="Download your prompt", visible=False, interactive=False,
                         )
 
-                with gr.Accordion("AI Prompt Refinement", open=True):
-                    new_refinement_html = gr.HTML(
-                        value=EMPTY_REFINEMENT_HTML,
-                        elem_id="new-refinement-panel",
-                    )
-
-                new_history = gr.Textbox(
-                    label="Evaluation History (for loaded prompt)",
-                    lines=6,
-                    interactive=False,
-                )
+                    with gr.Column(scale=1):
+                        gr.HTML(_INPUT_HEADER)
+                        new_results_html = gr.HTML(
+                            value=EMPTY_RESULTS_HTML, elem_id="new-results-panel",
+                        )
 
             # ═══════════════════════════════════════════════════════════════
-            # TAB: Token Pricing
-            # ═══════════════════════════════════════════════════════════════
-            with gr.Tab("Token Pricing", id="tab-pricing"):
-                gr.Markdown(
-                    "Enter a prompt to see how many tokens it uses and what it "
-                    "costs across all your configured providers. Only providers "
-                    "with saved API keys are shown."
-                )
-                pricing_prompt_input = gr.Textbox(
-                    label="Prompt",
-                    placeholder="Paste or type a prompt here…",
-                    lines=6,
-                )
-                pricing_calc_btn = gr.Button(
-                    "💰 Calculate Pricing", variant="primary",
-                )
-                pricing_results_html = gr.HTML(
-                    value=EMPTY_PRICING_HTML,
-                    elem_id="pricing-results-panel",
-                )
-
-            # ═══════════════════════════════════════════════════════════════
-            # TAB: Settings
+            # TAB 3: Settings
             # ═══════════════════════════════════════════════════════════════
             with gr.Tab("Settings", id="tab-settings"):
                 gr.Markdown("### API Key Configuration")
                 gr.Markdown(
-                    "Keys are validated, saved to `.env`, and loaded automatically "
-                    "on app startup. They are **only** used when running evaluations."
+                    "Keys are validated, saved to `.env`, and loaded automatically on startup."
                 )
                 openai_key_input = gr.Textbox(
-                    label="OpenAI API Key",
-                    placeholder="sk-…",
-                    type="password",
-                    value=openai_key_init,
+                    label="OpenAI API Key", placeholder="sk-…",
+                    type="password", value=openai_key_init,
                 )
                 anthropic_key_input = gr.Textbox(
-                    label="Anthropic API Key",
-                    placeholder="sk-ant-…",
-                    type="password",
-                    value=anthropic_key_init,
+                    label="Anthropic API Key", placeholder="sk-ant-…",
+                    type="password", value=anthropic_key_init,
                 )
                 google_key_input = gr.Textbox(
-                    label="Google API Key",
-                    placeholder="AIza…",
-                    type="password",
-                    value=google_key_init,
+                    label="Google API Key", placeholder="AIza…",
+                    type="password", value=google_key_init,
                 )
                 save_keys_btn = gr.Button("Save API Keys", variant="primary")
                 keys_status = gr.Markdown("")
@@ -813,105 +539,37 @@ def build_app() -> gr.Blocks:
         # Event wiring
         # ══════════════════════════════════════════════════════════════════
 
-        # -- Settings --
+        # Settings
         save_keys_btn.click(
             fn=_persist_keys,
             inputs=[openai_key_input, anthropic_key_input, google_key_input],
             outputs=[keys_status],
         )
 
-        # -- Sidebar: user prompt CRUD --
-        new_save_btn.click(
-            fn=save_prompt,
-            inputs=[new_title, new_text, new_category, prompts_state],
-            outputs=[prompts_state, prompt_selector, new_status],
-        )
-        delete_btn.click(
-            fn=delete_prompt,
-            inputs=[prompt_selector, prompts_state],
-            outputs=[prompts_state, prompt_selector, sidebar_status],
-        )
-        load_btn.click(
-            fn=load_selected_prompt,
-            inputs=[prompt_selector, prompts_state],
-            outputs=[new_title, new_text, new_category, new_history],
+        # Analyze tab
+        def _run_analyze(uploaded_file, pasted_text, display_name):
+            model = (
+                _DISPLAY_TO_MODEL.get(display_name)
+                or (display_name if display_name in ALL_MODELS else ALL_MODELS[0])
+            )
+            return analyze_prompt(uploaded_file, pasted_text, model)
+
+        analyze_btn.click(
+            fn=_run_analyze,
+            inputs=[file_upload, paste_input, model_selector],
+            outputs=[
+                analyze_cost_html,
+                analyze_input_html,
+                analyze_output_html,
+                analyze_comparison_html,
+            ],
+            api_name="analyze_prompt_api",
         )
 
-        # -- Template tab: template selection + dynamic inputs --
-        tpl_category_filter.change(
-            fn=_filter_templates,
-            inputs=[tpl_category_filter],
-            outputs=[tpl_dropdown],
-        )
-        tpl_dropdown.change(
-            fn=_on_template_selected,
-            inputs=[tpl_dropdown],
-            outputs=[tpl_description, tpl_assembled] + tpl_inputs,
-        )
-        tpl_provider.change(
-            fn=_update_model_choices,
-            inputs=[tpl_provider],
-            outputs=[tpl_model],
-        )
-
-        # -- Template tab: generate assembled prompt (read-only for copy) --
-        tpl_generate_btn.click(
-            fn=_generate_assembled_prompt,
-            inputs=[tpl_dropdown] + tpl_inputs,
-            outputs=[tpl_assembled],
-        )
-
-        # -- Template tab: copy assembled prompt to clipboard via JS --
-        # Uses execCommand fallback for non-HTTPS (0.0.0.0) origins where
-        # navigator.clipboard is unavailable.
-        tpl_copy_btn.click(
-            fn=None,
-            inputs=[tpl_assembled],
-            outputs=[],
-            js="""(x) => {
-              var t = '';
-              if (typeof x === 'string') t = x;
-              if (!t) {
-                var el = document.querySelector('#tpl-assembled-prompt textarea');
-                if (el) t = el.value || '';
-              }
-              if (!t) return [];
-              var ta = document.createElement('textarea');
-              ta.value = t;
-              ta.style.position = 'fixed';
-              ta.style.left = '-9999px';
-              document.body.appendChild(ta);
-              ta.select();
-              try { document.execCommand('copy'); } catch(e) {}
-              document.body.removeChild(ta);
-              var btn = document.querySelector('#tpl-copy-btn button') || document.querySelector('#tpl-copy-btn');
-              if (btn) {
-                var orig = btn.textContent;
-                btn.textContent = '✓ Copied!';
-                setTimeout(function(){ btn.textContent = orig; }, 2000);
-              }
-              return [];
-            }""",
-        )
-
-        # -- Template tab: evaluate + refine --
-        tpl_evaluate_btn.click(
-            fn=_assemble_and_evaluate,
-            inputs=[tpl_dropdown] + tpl_inputs + [tpl_provider, tpl_model, prompts_state],
-            outputs=[tpl_results_html, prompts_state],
-        )
-        tpl_refine_btn.click(
-            fn=_assemble_and_refine,
-            inputs=[tpl_dropdown] + tpl_inputs + [tpl_provider, tpl_model],
-            outputs=[tpl_refinement_html],
-        )
-
-        # -- New prompt tab: framework auto-detection (no LLM) --
+        # Write New Prompt: framework detection
         def _detect_and_update(idea: str) -> tuple[str, str]:
-            """Return (badge_html, framework_value) based on typed idea."""
             fw, reason, confidence = detect_framework(idea)
-            badge = render_detection_badge(fw, reason, confidence)
-            return badge, fw
+            return render_detection_badge(fw, reason, confidence), fw
 
         new_idea.change(
             fn=_detect_and_update,
@@ -919,48 +577,34 @@ def build_app() -> gr.Blocks:
             outputs=[new_framework_badge, new_framework_radio],
         )
 
-        # -- New prompt tab: build structured prompt (no LLM) --
-        def _build_structured_prompt(idea: str, framework: str) -> str:
-            """Generate a PROMPT or CROFT structured prompt from the user's idea."""
-            return build_prompt(idea, framework)  # type: ignore[arg-type]
-
         new_build_btn.click(
-            fn=_build_structured_prompt,
+            fn=lambda idea, fw: build_prompt(idea, fw),  # type: ignore[arg-type]
             inputs=[new_idea, new_framework_radio],
             outputs=[new_text],
         )
 
-        # -- New prompt tab: provider/model --
         new_provider.change(
             fn=_update_model_choices,
             inputs=[new_provider],
             outputs=[new_model],
         )
 
-        # -- New prompt tab: evaluate + refine --
         new_evaluate_btn.click(
             fn=evaluate_new_prompt,
-            inputs=[new_title, new_text, new_category, new_provider, new_model, prompts_state],
-            outputs=[new_results_html, prompts_state],
-        )
-        new_refine_btn.click(
-            fn=handle_refine_new,
-            inputs=[new_text, new_provider, new_model],
-            outputs=[new_refinement_html],
+            inputs=[new_title, new_text, new_category, new_provider, new_model],
+            outputs=[new_results_html],
         )
 
-        # -- Token Pricing tab --
-        pricing_calc_btn.click(
-            fn=_handle_calculate_pricing,
-            inputs=[pricing_prompt_input],
-            outputs=[pricing_results_html],
-        )
+        # Save as .txt
+        def _save_and_show(title: str, text: str):
+            path, msg = save_prompt_as_txt(title, text)
+            visible = path is not None
+            return gr.update(visible=visible, value=path), msg
 
-        # -- Template tab: Calculate Pricing button --
-        tpl_pricing_btn.click(
-            fn=_handle_calculate_pricing,
-            inputs=[tpl_assembled],
-            outputs=[tpl_results_html],
+        new_save_btn.click(
+            fn=_save_and_show,
+            inputs=[new_title, new_text],
+            outputs=[new_download, new_status],
         )
 
     app._theme = theme
@@ -974,7 +618,6 @@ def build_app() -> gr.Blocks:
 
 
 def main():
-    """Build and launch the Gradio server."""
     app = build_app()
     app.launch(
         server_name="127.0.0.1",

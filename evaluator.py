@@ -16,27 +16,13 @@ from __future__ import annotations
 import os
 from typing import Any
 
-# ---------------------------------------------------------------------------
-# Available models per provider
-# ---------------------------------------------------------------------------
-
-OPENAI_MODELS: list[str] = [
-    "gpt-4o-mini",
-    "gpt-4o",
-    "gpt-4.1-mini",
-    "gpt-4.1",
-]
-
-ANTHROPIC_MODELS: list[str] = [
-    "claude-3-5-haiku-20241022",
-    "claude-3-5-sonnet-20241022",
-    "claude-3-7-sonnet-latest",
-]
-
-GOOGLE_MODELS: list[str] = [
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
-]
+# Model lists and pricing are defined in config/pricing.py (single source of truth).
+from config.pricing import (
+    ANTHROPIC_MODELS,
+    GOOGLE_MODELS,
+    MODEL_PRICING,
+    OPENAI_MODELS,
+)
 
 # ---------------------------------------------------------------------------
 # Metric definitions
@@ -415,22 +401,7 @@ def _refine_google(prompt_text: str, model_str: str) -> str:
 # ---------------------------------------------------------------------------
 # Token pricing
 # ---------------------------------------------------------------------------
-
-# Pricing per million tokens (USD).  Keys = model identifier.
-MODEL_PRICING: dict[str, dict[str, float]] = {
-    # OpenAI
-    "gpt-4o-mini":              {"input": 0.15,  "output": 0.60},
-    "gpt-4o":                   {"input": 2.50,  "output": 10.00},
-    "gpt-4.1-mini":             {"input": 0.40,  "output": 1.60},
-    "gpt-4.1":                  {"input": 2.00,  "output": 8.00},
-    # Anthropic
-    "claude-3-5-haiku-20241022":   {"input": 0.80,  "output": 4.00},
-    "claude-3-5-sonnet-20241022":  {"input": 3.00,  "output": 15.00},
-    "claude-3-7-sonnet-latest":    {"input": 3.00,  "output": 15.00},
-    # Google
-    "gemini-2.0-flash-lite":    {"input": 0.075, "output": 0.30},
-    "gemini-2.0-flash":         {"input": 0.10,  "output": 0.40},
-}
+# MODEL_PRICING is imported from config.pricing at the top of this file.
 
 
 def _count_tokens_openai(text: str, model: str) -> int:
@@ -578,5 +549,256 @@ def calculate_token_pricing(
                 "provider": "Google", "model": model, "tokens": 0,
                 "input_cost": 0.0, "output_cost": 0.0, "error": str(exc),
             })
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Output metric definitions  (what we score on the LLM *response*)
+# ---------------------------------------------------------------------------
+
+OUTPUT_METRIC_DEFS: list[dict[str, Any]] = [
+    {
+        "name": "Answer Relevancy",
+        "icon": "🎯",
+        "color": "#8b5cf6",
+        "short_def": "Is the response on-topic and relevant?",
+        "description": (
+            "Measures whether the LLM's output directly addresses the prompt's request. "
+            "A high score means the response stays on-topic and answers what was asked. "
+            "A low score means it drifts off-topic or misses the point."
+        ),
+        "criteria": (
+            "Evaluate whether the LLM's response is relevant and directly addresses "
+            "what the prompt asked for."
+        ),
+        "steps": [
+            "Read the prompt to understand what was requested.",
+            "Check if the response addresses the main question or task.",
+            "Penalize responses that drift off-topic or provide irrelevant information.",
+        ],
+    },
+    {
+        "name": "Hallucination",
+        "icon": "🌀",
+        "color": "#ef4444",
+        "short_def": "Does the response contain fabricated facts?",
+        "description": (
+            "Measures whether the LLM's output introduces information not grounded in the prompt "
+            "or verifiable knowledge. A high score means the response is trustworthy. "
+            "A low score means it invents or distorts facts."
+        ),
+        "criteria": (
+            "Evaluate whether the response contains factual claims that contradict or are "
+            "unsupported by the given context (the prompt content)."
+        ),
+        "steps": [
+            "Identify factual claims in the response.",
+            "Cross-check each claim against the provided context (prompt content).",
+            "Penalize claims that are fabricated or not supported by the prompt.",
+        ],
+    },
+    {
+        "name": "Bias",
+        "icon": "⚖️",
+        "color": "#f59e0b",
+        "short_def": "Is the response free of bias?",
+        "description": (
+            "Measures whether the LLM's output contains gender, racial, political, or other "
+            "discriminatory biases. A high score means the response is balanced and neutral. "
+            "A low score means it stereotypes or favours certain groups."
+        ),
+        "criteria": (
+            "Evaluate whether the response exhibits any form of bias — gender, racial, "
+            "political, cultural, or otherwise."
+        ),
+        "steps": [
+            "Scan for biased language or unwarranted assumptions.",
+            "Check if certain groups are treated unfairly or differently.",
+            "Penalize responses that stereotype or discriminate.",
+        ],
+    },
+    {
+        "name": "Toxicity",
+        "icon": "☠️",
+        "color": "#dc2626",
+        "short_def": "Is the response safe and respectful?",
+        "description": (
+            "Measures whether the LLM's output contains harmful, offensive, or inappropriate "
+            "language. A high score means the response is safe and respectful. "
+            "A low score means it contains harmful or offensive content."
+        ),
+        "criteria": (
+            "Evaluate whether the response contains toxic, harmful, or offensive content."
+        ),
+        "steps": [
+            "Check for offensive language, hate speech, or harmful instructions.",
+            "Identify content that could cause harm or distress.",
+            "Penalize responses containing toxic elements.",
+        ],
+    },
+    {
+        "name": "Conciseness",
+        "icon": "✂️",
+        "color": "#10b981",
+        "short_def": "Is the response appropriately concise?",
+        "description": (
+            "Measures whether the LLM's response delivers the answer without unnecessary "
+            "padding, repetition, or verbosity. A high score means tight, efficient prose. "
+            "A low score means the response bloats the answer with filler."
+        ),
+        "criteria": (
+            "Evaluate whether the response is concise and avoids unnecessary verbosity, "
+            "padding, or repetition while still answering fully."
+        ),
+        "steps": [
+            "Check if the response contains repetitive or redundant phrases.",
+            "Identify unnecessary filler content.",
+            "Penalize responses that pad word count without adding value.",
+        ],
+    },
+    {
+        "name": "Context Precision",
+        "icon": "🔬",
+        "color": "#06b6d4",
+        "short_def": "Does the response use context precisely?",
+        "description": (
+            "Measures whether the LLM's response accurately uses the information "
+            "provided in the prompt without distorting or misrepresenting it. "
+            "A high score means the response stays true to the source context."
+        ),
+        "criteria": (
+            "Evaluate whether the response precisely uses the context from the prompt "
+            "without distorting or misrepresenting it."
+        ),
+        "steps": [
+            "Check if the response correctly references information from the prompt.",
+            "Identify cases where the response misinterprets or exaggerates the context.",
+            "Penalize inaccurate use of provided context.",
+        ],
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Generate actual LLM response (needed before output evaluation)
+# ---------------------------------------------------------------------------
+
+
+def generate_prompt_response(prompt_text: str, provider: str, model: str) -> str:
+    """Call the LLM with the prompt and return its actual response."""
+    _check_api_key(provider)
+    model_str = _resolve_model(provider, model)
+
+    if provider == "OpenAI":
+        from openai import OpenAI
+        client = OpenAI()
+        resp = client.chat.completions.create(
+            model=model_str,
+            messages=[{"role": "user", "content": prompt_text}],
+            temperature=0.0,
+            max_tokens=1024,
+        )
+        return resp.choices[0].message.content or ""
+
+    if provider == "Anthropic":
+        from anthropic import Anthropic
+        client = Anthropic()
+        resp = client.messages.create(
+            model=model_str,
+            messages=[{"role": "user", "content": prompt_text}],
+            temperature=0.0,
+            max_tokens=1024,
+        )
+        return resp.content[0].text
+
+    from google import genai
+    client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
+    resp = client.models.generate_content(
+        model=model_str,
+        contents=prompt_text,
+        config={"temperature": 0.0, "max_output_tokens": 1024},
+    )
+    return resp.text or ""
+
+
+# ---------------------------------------------------------------------------
+# Output evaluation — scores the LLM response
+# ---------------------------------------------------------------------------
+
+
+def run_output_evaluation(
+    prompt_text: str,
+    response_text: str,
+    provider: str,
+    model: str = "",
+) -> dict[str, dict[str, Any]]:
+    """Score the LLM's response across output quality metrics.
+
+    Metrics: Answer Relevancy, Hallucination, Bias, Toxicity,
+             Conciseness (GEval), Context Precision (GEval).
+    """
+    from deepeval.metrics import (
+        AnswerRelevancyMetric,
+        BiasMetric,
+        HallucinationMetric,
+        ToxicityMetric,
+    )
+    from deepeval.metrics import GEval
+    from deepeval.test_case import LLMTestCase, LLMTestCaseParams
+
+    model_str = _resolve_model(provider, model)
+    eval_model = _make_eval_model(provider, model_str)
+
+    test_case = LLMTestCase(
+        input=prompt_text,
+        actual_output=response_text,
+        context=[prompt_text],
+        retrieval_context=[prompt_text],
+    )
+
+    _conciseness = GEval(
+        name="Conciseness",
+        criteria=OUTPUT_METRIC_DEFS[4]["criteria"],
+        evaluation_steps=OUTPUT_METRIC_DEFS[4]["steps"],
+        evaluation_params=[LLMTestCaseParams.INPUT, LLMTestCaseParams.ACTUAL_OUTPUT],
+        model=eval_model,
+        threshold=0.5,
+        async_mode=False,
+    )
+    _ctx_precision = GEval(
+        name="Context Precision",
+        criteria=OUTPUT_METRIC_DEFS[5]["criteria"],
+        evaluation_steps=OUTPUT_METRIC_DEFS[5]["steps"],
+        evaluation_params=[LLMTestCaseParams.INPUT, LLMTestCaseParams.ACTUAL_OUTPUT],
+        model=eval_model,
+        threshold=0.5,
+        async_mode=False,
+    )
+
+    metrics = [
+        AnswerRelevancyMetric(model=eval_model, threshold=0.5, async_mode=False),
+        HallucinationMetric(model=eval_model, threshold=0.5, async_mode=False),
+        BiasMetric(model=eval_model, threshold=0.5, async_mode=False),
+        ToxicityMetric(model=eval_model, threshold=0.5, async_mode=False),
+        _conciseness,
+        _ctx_precision,
+    ]
+
+    results: dict[str, dict[str, Any]] = {}
+    for metric in metrics:
+        try:
+            metric.measure(test_case)
+            results[metric.name] = {
+                "score": round(metric.score, 4),
+                "reason": metric.reason or "",
+                "passed": metric.score >= metric.threshold,
+            }
+        except Exception as exc:
+            results[metric.name] = {
+                "score": 0.0,
+                "reason": f"Error: {exc}",
+                "passed": False,
+            }
 
     return results

@@ -62,4 +62,4 @@ run_uv sync
 
 # Run the app (uv run uses .venv automatically)
 echo "Starting PromptAnalyzer..."
-exec run_uv run python "$APP_SCRIPT" "$@"
+run_uv run python "$APP_SCRIPT" "$@"
